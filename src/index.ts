@@ -1,23 +1,27 @@
 // OptMem (https://github.com/VictorTaelin/OptMem): permanent memory for agents.
 //
-// Replaces the "## Memory" block upstream asks you to paste into AGENTS.md:
-//   - the instructions are injected into every top-level session's system prompt
-//   - `memo` runs through native memo_* tools (argv, no shell quoting to break)
-//   - subagent sessions get neither the prompt nor the tools, since upstream's
-//     rule is that a subagent must never run memo
+// The instructions go into every top-level session, `memo` runs through native
+// memo_* tools (argv, so a note is never rewritten by a shell), and subagent
+// sessions get neither the instructions nor the tools.
 //
-// Needs the tool itself (python3, one file):
-//   curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
-// Without it the plugin stays silent. Options: { memo?: string, memoryDir?: string },
-// defaulting to ~/.optmem/memo and $MEMORY_DIR or ~/.optmem/memory.
+// Memories are scoped. `memo_note` records under the session's own project by
+// default, and `memo_wake` renders the store's own tree filtered to that
+// project plus `global`. Any memory stays reachable through `memo_recall` and
+// `memo_zoom`, so nothing is lost to a session that never worked on it.
+
 import { Plugin } from "@opencode/plugin"
 import { execFile } from "node:child_process"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+import { Registry } from "./registry.ts"
+import { renderWake } from "./render.ts"
+import { GLOBAL, Store, readSizes } from "./store.ts"
+import { matches, scopedView, type Relevant } from "./wake.ts"
+
 const INSTALL = "curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh"
-const TOOL_NAMES = ["memo_wake", "memo_note", "memo_nap", "memo_recall", "memo_zoom", "memo_forget"]
+const TOOL_NAMES = ["memo_wake", "memo_note", "memo_nap", "memo_recall", "memo_zoom", "memo_forget", "memo_scope"]
 const BLOCK = {
   type: "string",
   pattern: "^\\d+-\\d+$",
@@ -37,7 +41,7 @@ function instructions(memo: string, data: string): string {
   return `## Memory
 
 Your memory is OptMem:
-- The tools are memo_wake, memo_note, memo_nap, memo_recall, memo_zoom and memo_forget
+- The tools are memo_wake, memo_note, memo_nap, memo_recall, memo_zoom, memo_forget and memo_scope
 - Your memories are in \`${data}\`
 
 OptMem outlives every session, compaction, model and vendor change.
@@ -52,6 +56,18 @@ Its output names shell commands such as \`${memo} nap 0-1 "<your line>"\` or
 \`${memo} wake 2 296\`. Run each one through the matching tool instead of the
 shell: memo_nap { block: "0-1", summary: "<your line>" }, memo_wake { part: 2, snapshot: 296 }.
 
+### Scopes: what wake shows you
+
+memo_wake shows your memories for this project plus the ones scoped \`global\`,
+the preferences you want in every project. Memories of other projects are not
+in your wake; they are one memo_recall away, and memo_zoom opens any of them
+whole. Every wake names its scope, so you know how much of the store you hold.
+
+memo_note records under this project unless you pass scope: "global" for
+something true everywhere, or a comma-separated list such as
+scope: "orchestrator,feeds" when it belongs to several. memo_scope moves a
+memory you recorded under the wrong scope. Do not re-note what already exists.
+
 ### While working: register memories (mandatory)
 
 Call memo_note with one line of at most 280 bytes whenever you learn
@@ -59,15 +75,13 @@ something new, or something worth keeping happens. That covers a task
 worth real effort, a fact or insight the user teaches you, anything you
 learn about their life (even indirectly), any event of lasting effect.
 
-Do not register redundant memories.
-
 If memo_note asks a compression: do it with memo_nap before your next action.
 
 Never edit or delete anything under \`${data}\`: the tools manage it.
 
 ### When you need an old memory: search, or navigate
 
-memo_recall searches every memory, word for word (case-insensitive regex).
+memo_recall searches every memory ever recorded, word for word (case-insensitive regex).
 
 Your memories also form a binary tree: #0-1, #2-3 ... exist as one-line
 summaries, pairs of those as #0-3, and so on -- every \`#a-b\` line wake
@@ -79,10 +93,17 @@ export default Plugin.define({
   id: "optmem",
   async setup(ctx) {
     const memo = expand(typeof ctx.options.memo === "string" ? ctx.options.memo : "~/.optmem/memo")
-    const memoryDir = typeof ctx.options.memoryDir === "string" ? expand(ctx.options.memoryDir) : undefined
-    const data = memoryDir ?? expand(process.env.MEMORY_DIR || "~/.optmem/memory")
-    const prompt = instructions(pretty(memo), pretty(data))
+    const memoryDir = expand(
+      typeof ctx.options.memoryDir === "string"
+        ? ctx.options.memoryDir
+        : process.env.MEMORY_DIR || "~/.optmem/memory",
+    )
+    const prompt = instructions(pretty(memo), pretty(memoryDir))
     const parents = new Map<string, Promise<boolean>>()
+    // Keyed on the canonical directory, so every worktree of a repository
+    // shares one scope.
+    const watch = Registry.load(memoryDir).keyFor(ctx.location.project.canonical)
+    const scopes = [GLOBAL, watch]
 
     function isSubagent(sessionID: string): Promise<boolean> {
       let known = parents.get(sessionID)
@@ -99,62 +120,191 @@ export default Plugin.define({
       return known
     }
 
-    async function run(args: string[], context: { sessionID: string; signal: AbortSignal }) {
+    /** Runs `memo` and returns its output, or throws with what it printed. */
+    async function call(args: string[], context: { sessionID: string; signal: AbortSignal }): Promise<string> {
       if (await isSubagent(context.sessionID)) {
         throw new Error("You are a subagent. Don't run memo: only the top-level session records memories.")
       }
       if (!existsSync(memo)) throw new Error(`OptMem is not installed at ${pretty(memo)}. Ask the user to run: ${INSTALL}`)
 
-      const env = memoryDir ? { ...process.env, MEMORY_DIR: memoryDir } : process.env
-      const text = await new Promise<string>((resolve, reject) => {
-        execFile(memo, args, { env, signal: context.signal, timeout: 30_000, maxBuffer: 4 << 20 }, (error, stdout, stderr) => {
-          const output = [stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join("\n")
-          // wake exits 1 with instructions on stdout when a compression must come first: that is output, not failure.
-          if (error && !stdout.trim()) reject(new Error(output || error.message))
-          else resolve(output)
-        })
+      return new Promise<string>((resolve, reject) => {
+        execFile(
+          memo,
+          args,
+          { env: { ...process.env, MEMORY_DIR: memoryDir }, signal: context.signal, timeout: 30_000, maxBuffer: 4 << 20 },
+          (error, stdout, stderr) => {
+            const output = [stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join("\n")
+            // wake and nap exit 1 with instructions on stdout; that is output, not failure.
+            if (error && !stdout.trim()) reject(new Error(output || error.message))
+            else resolve(output)
+          },
+        )
       })
-      return { content: text }
+    }
+
+    /** The scope keys of `text`, validated against the registry. */
+    function parseScope(text: string | undefined): readonly string[] {
+      if (text === undefined || text === "") return [watch]
+
+      const keys = text.split(",").map((key) => key.trim()).filter(Boolean)
+      const registry = Registry.load(memoryDir)
+      const unknown = keys.filter((key) => !registry.has(key) && key !== GLOBAL)
+
+      if (unknown.length > 0) {
+        throw new Error(
+          `unknown scope: ${unknown.join(", ")}. Known: ${[GLOBAL, ...registry.list().keys()].join(", ") || GLOBAL}.`,
+        )
+      }
+
+      return keys
+    }
+
+    /** The view for this session, falling back to memo's own when the store is not ours to read. */
+    async function view(
+      part: number | undefined,
+      snapshot: number | undefined,
+      context: { sessionID: string; signal: AbortSignal },
+    ): Promise<{ content: string }> {
+      const store = Store.open(memoryDir)
+
+      if (store === undefined) {
+        const args = ["wake"]
+        if (part !== undefined) args.push(String(part))
+        if (snapshot !== undefined) args.push(String(snapshot))
+        return { content: await call(args, context) }
+      }
+
+      try {
+        const sizes = readSizes(memoryDir)
+        const total = store.count()
+        const seen = snapshot === undefined ? total : Math.min(snapshot, total)
+        const relevant: Relevant = (i) => matches(store.scope(i), scopes)
+        const rendered = scopedView(store, relevant, sizes.wakeLines)
+
+        // No pending-compression footer: memo's own prompt quotes the raw
+        // memories of the block it wants compressed, which can be another
+        // project's. memo_note still surfaces it, where it is written.
+        return {
+          content: renderWake({
+            lines: rendered.lines,
+            total: seen,
+            scopes,
+            part: part ?? 1,
+            snapshot: rendered.snapshot,
+            sizes,
+            awake: "You are awake.",
+          }),
+        }
+      } finally {
+        store.close()
+      }
     }
 
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "memo_wake",
         description:
-          "Read your OptMem memory. Call first, before any other tool, in every session, then do exactly what it prints. " +
-          "Long memories arrive in parts: pass the part and snapshot it names to continue.",
+          "Read your OptMem memory: your project's memories plus the ones scoped global. Call first, before any other tool, " +
+          "in every session, then do exactly what it prints. Long views arrive in parts: pass the part and snapshot it names.",
         input: {
           type: "object",
           properties: {
             part: { type: "integer", minimum: 1, description: "Part to read, as named by the previous part's footer" },
-            snapshot: { type: "integer", minimum: 0, description: "The T value from that footer; requires part" },
+            snapshot: { type: "integer", minimum: 0, description: "The memory count from that footer; requires part" },
+            scope: {
+              type: "string",
+              enum: ["project", "all"],
+              description: "'project' (default) shows this project and global; 'all' shows every memory",
+            },
           },
           additionalProperties: false,
         },
         options: { codemode: false },
         execute: async (input, context) => {
-          const { part, snapshot } = input as { part?: number; snapshot?: number }
+          const { part, snapshot, scope } = input as { part?: number; snapshot?: number; scope?: string }
           if (snapshot !== undefined && part === undefined) throw new Error("snapshot requires part")
-          const args = ["wake"]
-          if (part !== undefined) args.push(String(part))
-          if (snapshot !== undefined) args.push(String(snapshot))
-          return run(args, context)
+
+          if (scope === "all") {
+            const args = ["wake"]
+            if (part !== undefined) args.push(String(part))
+            if (snapshot !== undefined) args.push(String(snapshot))
+            return { content: await call(args, context) }
+          }
+
+          return view(part, snapshot, context)
         },
       })
+
       editor.add({
         name: "memo_note",
         description:
-          "Record one memory in OptMem: one line, at most 280 bytes. Use whenever you learn something new or something worth " +
-          "keeping happens. If the result asks for a compression, do it with memo_nap before your next action.",
+          "Record one memory in OptMem: one line, at most 280 bytes, scoped to this project unless you pass a scope. " +
+          "Use whenever you learn something new or something worth keeping happens. " +
+          "If the result asks for a compression, do it with memo_nap before your next action.",
         input: {
           type: "object",
-          properties: { text: { type: "string", minLength: 1, description: "The memory: one line, at most 280 bytes" } },
+          properties: {
+            text: { type: "string", minLength: 1, description: "The memory: one line, at most 280 bytes" },
+            scope: {
+              type: "string",
+              description: "'global' for something true in every project, or a comma-separated list of project keys such as 'orchestrator,feeds'",
+            },
+          },
           required: ["text"],
           additionalProperties: false,
         },
         options: { codemode: false },
-        execute: async (input, context) => run(["note", (input as { text: string }).text], context),
+        execute: async (input, context) => {
+          const { text, scope } = input as { text: string; scope?: string }
+          const keys = parseScope(scope)
+          const content = await call(["note", text], context)
+          const store = Store.open(memoryDir)
+          const saved = /Saved as #(\d+)\./.exec(content)
+
+          if (store !== undefined && saved?.[1] !== undefined) {
+            try {
+              store.writeScope(Number(saved[1]), keys)
+            } finally {
+              store.close()
+            }
+          }
+
+          return { content }
+        },
       })
+
+      editor.add({
+        name: "memo_scope",
+        description: "Move one memory to another scope, for a note recorded under the wrong one.",
+        input: {
+          type: "object",
+          properties: {
+            id: { type: "integer", minimum: 0, description: "The memory id, as memo prints it" },
+            scope: {
+              type: "string",
+              description: "'global', a comma-separated list of project keys, or an empty string to leave it unclassified",
+            },
+          },
+          required: ["id", "scope"],
+          additionalProperties: false,
+        },
+        options: { codemode: false },
+        execute: async (input) => {
+          const { id, scope } = input as { id: number; scope: string }
+          const keys = parseScope(scope)
+          const store = Store.open(memoryDir)
+
+          if (store === undefined) throw new Error(`no readable OptMem store at ${pretty(memoryDir)}`)
+
+          try {
+            store.writeScope(id, keys)
+            return { content: `Scoped #${id} to ${keys.join(", ") || "nothing"}.` }
+          } finally {
+            store.close()
+          }
+        },
+      })
+
       editor.add({
         name: "memo_nap",
         description:
@@ -172,12 +322,15 @@ export default Plugin.define({
         execute: async (input, context) => {
           const { block, summary } = input as { block?: string; summary?: string }
           if ((block === undefined) !== (summary === undefined)) throw new Error("Pass both block and summary, or neither.")
-          return run(block === undefined ? ["nap"] : ["nap", block, summary!], context)
+          return { content: await call(block === undefined ? ["nap"] : ["nap", block, summary!], context) }
         },
       })
+
       editor.add({
         name: "memo_recall",
-        description: "Search every OptMem memory ever recorded, word for word, with a case-insensitive Python regex.",
+        description:
+          "Search every OptMem memory ever recorded, word for word, with a case-insensitive Python regex. The only way to " +
+          "reach another project's memories, which wake does not show you.",
         input: {
           type: "object",
           properties: { regex: { type: "string", minLength: 1 } },
@@ -185,8 +338,12 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { codemode: false },
-        execute: async (input, context) => run(["recall", (input as { regex: string }).regex], context),
+        execute: async (input, context) => {
+          const { regex } = input as { regex: string }
+          return { content: await call(["recall", regex], context) }
+        },
       })
+
       editor.add({
         name: "memo_zoom",
         description: "Open one node of the OptMem memory tree (an #a-b line from wake) into its two halves.",
@@ -197,8 +354,12 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { codemode: false },
-        execute: async (input, context) => run(["zoom", (input as { block: string }).block], context),
+        execute: async (input, context) => {
+          const { block } = input as { block: string }
+          return { content: await call(["zoom", block], context) }
+        },
       })
+
       editor.add({
         name: "memo_forget",
         description:
@@ -210,7 +371,10 @@ export default Plugin.define({
           additionalProperties: false,
         },
         options: { codemode: false },
-        execute: async (input, context) => run(["forget", (input as { block: string }).block], context),
+        execute: async (input, context) => {
+          const { block } = input as { block: string }
+          return { content: await call(["forget", block], context) }
+        },
       })
     })
 

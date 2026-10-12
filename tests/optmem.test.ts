@@ -5,11 +5,17 @@ import { join } from "node:path"
 
 import plugin from "../src/index"
 
-type Tool = { name: string; execute: (input: unknown, context: unknown) => Promise<{ content: string }> }
+type Tool = {
+  name: string
+  options?: { codemode?: boolean }
+  execute: (input: unknown, context: unknown) => Promise<{ content: string }>
+}
 type ContextEvent = { sessionID: string; system: Array<{ type: string; text: string }>; tools: Record<string, unknown> }
 
 const root = mkdtempSync(join(tmpdir(), "optmem-test-"))
 const memo = join(root, "memo")
+const memoryDir = join(root, "memory")
+const project = "/home/user/projects/example"
 
 // Stub memo: echoes its argv one per line; bare `wake` exits 1 with stdout, like the real tool when a compression is due.
 writeFileSync(
@@ -24,11 +30,12 @@ chmodSync(memo, 0o755)
 
 afterAll(() => rmSync(root, { recursive: true, force: true }))
 
-async function load(memoPath = memo) {
+async function load(memoPath = memo, canonical = project) {
   const tools = new Map<string, Tool>()
   let hook!: (event: ContextEvent) => Promise<void>
   const context = {
-    options: { memo: memoPath, memoryDir: join(root, "memory") },
+    options: { memo: memoPath, memoryDir },
+    location: { project: { canonical, directory: canonical, id: "prj_test" } },
     tool: {
       transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => {
         callback({ add: (tool) => tools.set(tool.name, tool) })
@@ -54,6 +61,21 @@ function event(sessionID: string): ContextEvent {
 }
 
 describe("optmem", () => {
+  test("registers every memo tool as a direct tool, not behind Code Mode", async () => {
+    const { tools } = await load()
+
+    expect([...tools.keys()].sort()).toEqual([
+      "memo_forget",
+      "memo_nap",
+      "memo_note",
+      "memo_recall",
+      "memo_scope",
+      "memo_wake",
+      "memo_zoom",
+    ])
+
+    for (const tool of tools.values()) expect(tool.options?.codemode).toBe(false)
+  })
   test("passes text as one argv entry, with MEMORY_DIR set", async () => {
     const { tools } = await load()
     const tricky = `it's "quoted" $HOME \`x\``
