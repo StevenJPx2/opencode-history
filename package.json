@@ -1,0 +1,23 @@
+{
+  "name": "opencode-optmem",
+  "version": "0.1.0",
+  "description": "OptMem permanent memory as native OpenCode tools.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests",
+    "check": "bun run typecheck && bun run test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.12"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "5.9.2"
+  }
+}
