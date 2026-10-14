@@ -50,8 +50,8 @@ global store to these models for compression.
 Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with automatic memory:
 
 - Full session exports are archived in `~/.local/share/optmem/archive.sqlite` (option `archivePath`).
-- Orchestrator's `memory.select` judge picks passages worth remembering, and its redactor masks secrets.
-- The historian model (`model`, then `fallbackModel`) extracts source-cited memories in the background.
+- Each completed assistant reply, with its turn's user message, goes to the historian model (`model`, then `fallbackModel`). It extracts source-cited memories in the background, or none.
+- Secrets are masked locally before any archived text reaches a model.
 - Each model request gets a bounded block of project and global memories. The `memory` tool asks the historian when that is not enough.
 
 Existing OptMem notes, scopes, summaries and config are imported on startup. The import checks every byte, can be re-run safely, and never writes to the original store.

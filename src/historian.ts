@@ -1,12 +1,11 @@
 import { Archive, digest, type Evidence, type Job, type Remembered, type Scope } from "./archive.ts"
+import { redact, worthExtracting } from "./redact.ts"
 
 export interface Embeddings {
   model: string
   encode(texts: string[], kind: "query" | "document", signal: AbortSignal): Promise<number[][]>
 }
 export interface HistorianOptions {
-  select(text: string, kind: string, signal: AbortSignal): Promise<{selected: boolean; text: string}>
-  redact(text: string, signal: AbortSignal): Promise<string>
   generate(prompt: string, signal: AbortSignal): Promise<string>
   embeddings?: Embeddings
   log(message: string): void
@@ -95,7 +94,7 @@ export class Historian {
     if (!entry) throw new MemoryError("Missing evidence")
 
     if (job.phase === "select") {
-      const verdict = await this.options.select(entry.text, entry.kind, signal)
+      const verdict = {selected: worthExtracting(entry.text, entry.kind), text: redact(entry.text)}
       this.archive.complete(job, () => {
         this.archive.db.query("INSERT INTO selections VALUES(?,?,?) ON CONFLICT(evidence) DO UPDATE SET selected=excluded.selected,text=excluded.text")
           .run(entry.id, Number(verdict.selected), verdict.text)
@@ -117,13 +116,15 @@ export class Historian {
     const selection = this.archive.db.query<{text: string}, [string]>("SELECT text FROM selections WHERE evidence=? AND selected=1").get(entry.id)
     if (!selection) throw new MemoryError("Evidence was not selected")
 
-    const neighbors = this.archive.db.query<Evidence, [string,string,number]>(`
+    // The turn so far: everything since its user message, inclusive.
+    const neighbors = this.archive.db.query<Evidence, [string,string,number,string,string,number]>(`
       SELECT id,project,session,message,kind,at,text,payload FROM evidence
-      WHERE session=? AND project=? AND at<=? AND kind IN ('user','assistant','shell','passage')
-      ORDER BY at DESC,id DESC LIMIT 5
-    `).all(entry.session, entry.project, entry.at).filter(row => row.id !== entry.id)
+      WHERE session=? AND project=? AND at<=? AND kind IN ('user','assistant','shell') AND at>=coalesce(
+        (SELECT max(at) FROM evidence WHERE session=? AND project=? AND kind='user' AND at<=?), 0)
+      ORDER BY at DESC,id DESC LIMIT 12
+    `).all(entry.session, entry.project, entry.at, entry.session, entry.project, entry.at).filter(row => row.id !== entry.id)
     const supplied = [{id: entry.id, kind: entry.kind, text: selection.text},
-      ...await Promise.all(neighbors.map(async row => ({id: row.id,kind:row.kind,text:await this.options.redact(row.text.slice(0, 4000), signal)})))]
+      ...neighbors.map(row => ({id: row.id, kind: row.kind, text: redact(row.text.slice(0, 4000))}))]
     const previous = this.archive.recall(entry.project, selection.text, 12)
     const result = await this.options.generate(`${CONTRACT}\n\n${JSON.stringify({project: entry.project, evidence: supplied, previous})}`, signal)
     const memories = validateExtraction(result, supplied, previous, entry.project)

@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { Archive } from "../src/archive.ts"
 import { importTranscript } from "../src/capture.ts"
 import { Historian, contextBlock, validateExtraction } from "../src/historian.ts"
-import { orchestrator } from "../src/services.ts"
+import { redact, worthExtracting } from "../src/redact.ts"
 import { setupUnified } from "../src/unified.ts"
 
 test("unified hooks recognize shared historian sessions and keep capturing ordinary sessions", async () => {
@@ -65,21 +65,28 @@ test("unified hooks recognize shared historian sessions and keep capturing ordin
   }
 })
 
-test("judge client sends the numeric request ids Orchestrator requires", async () => {
-  const seen: unknown[] = []
-  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", async fetch(request) {
-    const body = await request.json() as { id: unknown; method: string; params: { text: string } }
-    seen.push(body.id)
-    if (typeof body.id !== "number") return new Response("id must be u64", { status: 422 })
-    return Response.json({ id: body.id, result: body.method === "memory.select" ? { selected: true, text: body.params.text } : { text: "[REDACTED]" } })
-  } })
-  try {
-    const judge = orchestrator(`http://127.0.0.1:${server.port}`)
-    const signal = new AbortController().signal
-    expect(await judge.select("decided X", "user", signal)).toEqual({ selected: true, text: "decided X" })
-    expect(await judge.redact("sk-secret", signal)).toBe("[REDACTED]")
-    expect(seen).toEqual([1, 2])
-  } finally { server.stop(true) }
+test("redaction masks credential shapes but keeps ordinary text, paths and ids", () => {
+  const secrets = [
+    "sk-proj-abcdefghijklmnop1234567890",
+    "ghp_abcdefghijklmnopqrstuvwxyz0123",
+    "xoxb-1234567890-abcdefghij",
+    "AKIAABCDEFGHIJKLMNOP",
+    "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4",
+  ]
+  for (const secret of secrets) expect(redact(`use ${secret} now`)).toBe("use [REDACTED] now")
+  expect(redact("Authorization: Bearer abcdefghijklmnop1234")).toBe("Authorization: Bearer [REDACTED]")
+  expect(redact("password = hunter2pass")).toBe("password = [REDACTED]")
+  expect(redact('"api_key": "abc123def456"')).toBe('"api_key": "[REDACTED]"')
+  expect(redact("https://user:s3cretpw@example.com/x")).toBe("https://user:[REDACTED]@example.com/x")
+  const ordinary = "Decided to use SQLite WAL in /Users/me/Documents/Projects/opencode-optmem, see ses_ec57df3efffePjArZRfjvQQLUc and commit 2d3b71c."
+  expect(redact(ordinary)).toBe(ordinary)
+})
+
+test("only substantial assistant replies go to the historian", () => {
+  expect(worthExtracting("Decision confirmed: use OpenAI Luna for memory.", "assistant")).toBe(true)
+  expect(worthExtracting("ok", "assistant")).toBe(false)
+  expect(worthExtracting("Remember that the historian should use Luna.", "user")).toBe(false)
+  expect(worthExtracting("README.md src tests and more files here", "shell")).toBe(false)
 })
 
 const transcript = (assistant = "Decision confirmed: use OpenAI Luna for the historian.", completed: number | undefined = 3) => JSON.stringify({
@@ -117,10 +124,10 @@ test("background historian selects, extracts, embeds, and retries without blocki
   try {
     importTranscript(db, "alpha", transcript(), "ses_1")
     const historian = new Historian(db, {
-      select: async (text) => ({ selected: text.includes("Decision"), text }),
-      redact: async (text) => text,
       generate: async (prompt) => {
         if (fail) { fail = false; throw new Error("secret provider body") }
+        // The turn's user message travels with the assistant reply.
+        expect(prompt).toContain("Remember that the historian should use OpenAI Luna.")
         const source = /"id":"(passage:[^"]+m2[^"]+)"/.exec(prompt)![1]!
         return JSON.stringify({ memories: [{ text: "Historian uses OpenAI Luna", status: "confirmed", source, quote: "use OpenAI Luna" }] })
       },

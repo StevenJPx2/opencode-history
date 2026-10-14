@@ -6,7 +6,8 @@ import { Archive, digest, type Remembered, type Scope } from "./archive.ts"
 import { CaptureQueue, exportTranscript } from "./capture.ts"
 import { Historian, MemoryError, contextBlock, fuse, retrieve } from "./historian.ts"
 import { migrateOptMem } from "./migrate.ts"
-import { orchestrator, embeddingService, EMBEDDING_MODEL } from "./services.ts"
+import { redact } from "./redact.ts"
+import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
 
 type Context = Plugin.Context
 const option = (ctx: Context, key: string, fallback: string) => typeof ctx.options[key] === "string" ? ctx.options[key] as string : fallback
@@ -26,7 +27,6 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
     }
   } catch (error) { archive.close(); throw error }
   const project = archive.project(ctx.location.project.canonical)
-  const judge = orchestrator(option(ctx,"orchestratorURL","http://127.0.0.1:18790"),process.env.ORCHESTRATOR_DAEMON_TOKEN)
   const embeddings = typeof ctx.options.embeddingURL === "string" ? embeddingService(ctx.options.embeddingURL,option(ctx,"embeddingModel",EMBEDDING_MODEL)) : undefined
   // Subscription providers only answer inside a session, which also supplies
   // a stable prefix for prompt caching. One session per model for the whole
@@ -73,7 +73,7 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
     }
     throw new MemoryError("No historian model produced a response")
   }
-  const worker = new Historian(archive,{...judge,generate,...embeddings ? {embeddings} : {},log})
+  const worker = new Historian(archive,{generate,...embeddings ? {embeddings} : {},log})
   // The CLI reaches this process's own background service with its stored
   // credentials; an explicit --server URL would need a password.
   const capture = new CaptureQueue(archive,exportTranscript,option(ctx,"opencode","opencode"),log)
@@ -103,9 +103,9 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
         const sources = [...new Set([...memories.flatMap(memory => memory.sources),...hits.map(hit=>hit.id)])].slice(0,16)
         const evidence = await Promise.all(sources.map(async id => {
           const source = archive.evidence(id)!
-          return {id,kind:source.kind,at:source.at,text:await judge.redact(source.text.slice(0,5000),signal)}
+          return {id,kind:source.kind,at:source.at,text:redact(source.text.slice(0,5000))}
         }))
-        const prepared = await Promise.all(memories.map(async memory => ({...memory,text:await judge.redact(memory.text,signal)})))
+        const prepared = memories.map(memory => ({...memory,text:redact(memory.text)}))
         if (!evidence.length && !prepared.length) return {content:"No matching archived evidence found. This does not establish that the event never happened."}
 
         const fallback = () => ({content:JSON.stringify({notice:"Historian unavailable; retrieved evidence follows, not a synthesized answer.",memories:prepared,evidence})})
