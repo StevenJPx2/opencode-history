@@ -29,22 +29,38 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   const judge = orchestrator(option(ctx,"orchestratorURL","http://127.0.0.1:18790"),process.env.ORCHESTRATOR_DAEMON_TOKEN)
   const embeddings = typeof ctx.options.embeddingURL === "string" ? embeddingService(ctx.options.embeddingURL,option(ctx,"embeddingModel",EMBEDDING_MODEL)) : undefined
   // Subscription providers only answer inside a session, which also supplies
-  // a stable prefix for prompt caching. One dedicated session per model.
-  const historians = new Set<string>()
+  // a stable prefix for prompt caching. One session per model for the whole
+  // store, shared by every project instance, so the session list stays clean.
+  const isHistorian = (sessionID: string) =>
+    !!archive.db.query("SELECT 1 FROM meta WHERE key LIKE 'historian:%' AND value=?").get(sessionID)
   async function historianSession(model: {providerID:string;id:string;variant?:string}, signal: AbortSignal): Promise<string> {
-    const key = `historian:${ctx.location.directory}:${model.providerID}/${model.id}#${model.variant ?? ""}`
+    const key = `historian:${model.providerID}/${model.id}#${model.variant ?? ""}`
     const saved = archive.db.query<{value:string}, [string]>("SELECT value FROM meta WHERE key=?").get(key)?.value
     if (saved) {
       const alive = await ctx.session.get({sessionID:saved as never},{signal}).then(() => true, () => false)
       if (signal.aborted) throw new MemoryError("Historian cancelled")
-      if (alive) { historians.add(saved); return saved }
+      if (alive) return saved
     }
-    const session = await ctx.session.create({title:"OptMem historian (background memory)",model,
-      location:{directory:ctx.location.directory},metadata:{optmem:"historian"},
-      permissions:[{action:"*",resource:"*",effect:"deny"}]} as never,{signal})
-    archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key,session.id)
-    historians.add(session.id)
-    return session.id
+    // Only one instance creates it; the others retry once it exists.
+    const lock = `lock:${key}`
+    const claimed = archive.db.transaction(() => {
+      const held = archive.db.query<{value:string}, [string]>("SELECT value FROM meta WHERE key=?").get(lock)
+      if (held && Number(held.value) > Date.now()) return false
+
+      archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(lock,String(Date.now()+60_000))
+      return true
+    }).immediate()
+    if (!claimed) throw new MemoryError("Historian session is being created")
+
+    try {
+      const session = await ctx.session.create({title:"OptMem historian (background memory)",model,
+        location:{directory:homedir()},metadata:{optmem:"historian"},
+        permissions:[{action:"*",resource:"*",effect:"deny"}]} as never,{signal})
+      archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key,session.id)
+      return session.id
+    } finally {
+      archive.db.query("DELETE FROM meta WHERE key=?").run(lock)
+    }
   }
   async function generate(prompt: string, signal: AbortSignal): Promise<string> {
     for (const model of models) {
@@ -107,7 +123,7 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   await ctx.session.hook("context", async event => {
     for (const name of LEGACY_TOOLS) delete event.tools[name]
     // The historian's own requests must not recall memories into themselves.
-    if (historians.has(event.sessionID)) {
+    if (isHistorian(event.sessionID)) {
       delete event.tools.memory
       return
     }
@@ -138,7 +154,7 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
       for await (const event of ctx.event.subscribe({signal:controller.signal})) {
         const data = event.data as Record<string,unknown>
         if (!event.type.startsWith("session.") || !("durable" in event) || typeof data.sessionID !== "string") continue
-        if (event.location?.directory !== ctx.location.directory || historians.has(data.sessionID)) continue
+        if (event.location?.directory !== ctx.location.directory || isHistorian(data.sessionID)) continue
 
         archive.capture({id:`event:${event.id}`,project,session:data.sessionID,message:event.id,kind:"event",at:event.created,text:"",payload:JSON.stringify(event)},false)
         if (["session.execution.succeeded","session.execution.failed","session.execution.interrupted","session.inbox.enqueued"].includes(event.type)) {

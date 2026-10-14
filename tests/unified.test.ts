@@ -1,8 +1,69 @@
 import { expect, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { Archive } from "../src/archive.ts"
 import { importTranscript } from "../src/capture.ts"
 import { Historian, contextBlock, validateExtraction } from "../src/historian.ts"
 import { orchestrator } from "../src/services.ts"
+import { setupUnified } from "../src/unified.ts"
+
+test("unified hooks recognize shared historian sessions and keep capturing ordinary sessions", async () => {
+  const root = mkdtempSync(join(tmpdir(), "optmem-unified-"))
+  const archivePath = join(root, "archive.sqlite")
+  const archive = new Archive(archivePath)
+  const directory = join(root, "project")
+  type ContextEvent = { sessionID: string; tools: Record<string, unknown>; system: Array<{ type: string; text: string }>; messages: [] }
+  let hook!: (event: ContextEvent) => Promise<void>
+  let dispose: (() => void) | undefined
+  let start!: () => void
+  const ready = new Promise<void>(resolve => { start = resolve })
+  let finish!: () => void
+  const drained = new Promise<void>(resolve => { finish = resolve })
+  const ctx = {
+    options: { archivePath, memoryDir: join(root, "missing") },
+    location: { directory, project: { canonical: directory } },
+    tool: { transform: async () => {} },
+    session: { hook: async (_name: string, callback: typeof hook) => { hook = callback } },
+    event: { async *subscribe() {
+      await ready
+
+      for (const sessionID of ["historian", "ordinary"]) {
+        yield { id: sessionID, type: "session.message.created", durable: true, created: 1, location: { directory }, data: { sessionID } }
+      }
+
+      finish()
+    } },
+  }
+
+  try {
+    dispose = await setupUnified(ctx as unknown as Parameters<typeof setupUnified>[0], [])
+    // Another plugin instance can register a historian after this one starts.
+    archive.db.query("INSERT INTO meta VALUES(?,?)").run("historian:test/model#", "historian")
+    archive.db.query("INSERT INTO meta VALUES(?,?)").run("lock:historian:test/model#", "ordinary")
+    const ordinary: ContextEvent = { sessionID: "ordinary", tools: { memory: {}, memo_wake: {}, read: {} }, system: [], messages: [] }
+    await hook(ordinary)
+    expect(Object.keys(ordinary.tools)).toEqual(["memory", "read"])
+    expect(ordinary.system).toHaveLength(1)
+
+    const historian: ContextEvent = { sessionID: "historian", tools: { memory: {}, memo_note: {}, read: {} }, system: [], messages: [] }
+    await hook(historian)
+    expect(Object.keys(historian.tools)).toEqual(["read"])
+    expect(historian.system).toHaveLength(0)
+
+    start()
+    await drained
+    expect(archive.evidence("event:historian")).toBeNull()
+    expect(archive.evidence("event:ordinary")?.session).toBe("ordinary")
+  } finally {
+    start()
+    dispose?.()
+    // Disposal closes the plugin's connection asynchronously.
+    await Bun.sleep(10)
+    archive.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test("judge client sends the numeric request ids Orchestrator requires", async () => {
   const seen: unknown[] = []
