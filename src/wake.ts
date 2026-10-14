@@ -3,13 +3,13 @@
 // memo's `cover` tiles [0,T) with aligned power-of-two blocks and keeps a block
 // whole only while it is small relative to its age, so detail decays with age.
 // This is the same tiling, then one filter: a block stands in for the view only
-// when most of what it covers is in scope, and otherwise splits. A block whose
+// when everything it covers is in scope, and otherwise splits. A block whose
 // summary has not been built splits too, so scoped wake never refuses where
 // memo would.
 
 import { GLOBAL, type Store } from "./store.ts"
 
-export const THRESHOLD = 0.6
+export const THRESHOLD = 1
 
 export interface Line {
   readonly text: string

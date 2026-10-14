@@ -52,7 +52,7 @@ memory `i`, holding a comma-separated key list padded with spaces.
 memo_note({ text: "Shop: Workers only, no Node target" })            // scope = this project
 memo_note({ text: "Prefers bullets over run-on lists", scope: "global" })
 memo_note({ text: "Gate events through orchestrator.gate", scope: "orchestrator,feeds" })
-memo_scope({ id: 142, scope: "studio" })                          // reclassify one memory
+memo_scope({ id: 142, scope: "Studio" })                          // reclassify one memory
 memo_wake({})                                                         // this project plus global
 memo_wake({ scope: "all" })                                           // memo's own global view
 ```
@@ -68,11 +68,10 @@ The plugin renders the view from `LOG.txt`, `TREE/` and `SCOPE.txt`:
 
 1. Tile `[0, T)` with aligned blocks whose detail decays with age, as memo's
    `cover` does.
-2. A block whose memories are at least 60% in scope stands for the view, as its
+2. A block whose memories are all in scope stands for the view, as its
    summary, or as the raw memory when it is a single one.
-3. A block under 60% splits into its halves, and an out-of-scope single drops
-   out. A block whose summary is not built splits too, so wake never refuses
-   where memo would.
+3. A mixed-scope block splits into its halves, and an out-of-scope single drops
+   out. A block whose summary is not built splits too.
 4. The decay factor is searched until the view fits `WAKE_LINES`, and leftover
    budget goes to the newest block. A view that still overshoots keeps the
    present.
@@ -82,17 +81,12 @@ that watch for its footers keep working: `Not awake yet. Call memo_wake with
 part N and snapshot T.`, `You are awake.`, and the paging header naming the
 scope.
 
-Two deliberate differences from `memo wake`:
-
-- **No pending-compression footer.** memo's own prompt quotes the raw memories
-  of the block it wants compressed, which can be another project's. `memo_note`
-  still surfaces it, where the memory was written.
-- **Never refuses.** A block whose summary is missing splits down to raw
-  memories instead of asking for a compression first.
+The pending-compression queue is handled by the background worker. Scoped wake
+omits its prompts because they can quote another project's memories.
 
 At startup the plugin checks the store's shape: `LOG.txt` whole records, a
-parseable first record, whole `TREE/` records. On a mismatch it falls back to
-memo's own `wake` and says so.
+parseable first record, whole `TREE/` records. Scoped wake reports an error when
+the layout is unreadable. `scope: "all"` explicitly requests unfiltered wake.
 
 ## Deployment
 
@@ -102,9 +96,9 @@ local plugin directory is loaded from its `index.ts`.
 
 ## Testing
 
-- Unit tests over a seeded store in OptMem's layout: interleaved projects, the
-  60% rule, an unbuilt summary, unscoped memories, an empty store, and scope
-  record round-trips.
+- Unit tests over a seeded store in OptMem's layout: interleaved projects,
+  strict scope isolation, unbuilt summaries, unscoped memories, empty stores,
+  and scope record round-trips.
 - Contract tests against the real `memo` in a temporary `MEMORY_DIR`: each scope
   form, wake from two projects, `scope: "all"`, `memo_scope`, an unknown scope,
   and cross-project `memo_recall`.
@@ -113,9 +107,5 @@ local plugin directory is loaded from its `index.ts`.
 
 ## Open questions
 
-- **Existing memories.** All 207 are unclassified, so scoped wake shows nothing
-  until they are assigned. Two options: a classification pass, where the agent
-  proposes a key per memory for review, or seeding only the handful that are
-  true everywhere and leaving the rest for `memo_recall`.
 - **Other-project hint.** Whether wake ends with a count such as "34 memories
   from other projects", or stays silent.

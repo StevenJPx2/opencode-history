@@ -30,12 +30,22 @@ chmodSync(memo, 0o755)
 
 afterAll(() => rmSync(root, { recursive: true, force: true }))
 
-async function load(memoPath = memo, canonical = project) {
+async function load(memoPath = memo, canonical = project, options: Record<string, unknown> = {}) {
   const tools = new Map<string, Tool>()
   let hook!: (event: ContextEvent) => Promise<void>
   const context = {
-    options: { memo: memoPath, memoryDir },
+    options: { memo: memoPath, memoryDir, compression: false, ...options },
     location: { project: { canonical, directory: canonical, id: "prj_test" } },
+    // The models the background compressor would consider, and a reply.
+    model: {
+      list: async () => ({
+        data: [
+          { providerID: "test", modelID: "test" },
+          { providerID: "opencode", modelID: "mimo-v2.6-flash-free" },
+        ],
+      }),
+    },
+    generate: { text: async () => ({ text: "a line from the model" }) },
     tool: {
       transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => {
         callback({ add: (tool) => tools.set(tool.name, tool) })
@@ -85,7 +95,7 @@ describe("optmem", () => {
 
   test("maps optional arguments onto memo's positional ones", async () => {
     const { tools } = await load()
-    expect((await call(tools, "memo_wake", { part: 2, snapshot: 296 })).content).toEndWith("[wake]\n[2]\n[296]")
+    expect((await call(tools, "memo_wake", { scope: "all", part: 2, snapshot: 296 })).content).toEndWith("[wake]\n[2]\n[296]")
     expect((await call(tools, "memo_nap", { block: "0-1", summary: "s" })).content).toEndWith("[nap]\n[0-1]\n[s]")
     expect((await call(tools, "memo_nap", {})).content).toEndWith("[nap]")
     await expect(call(tools, "memo_nap", { block: "0-1" })).rejects.toThrow("both block and summary")
@@ -94,7 +104,8 @@ describe("optmem", () => {
 
   test("returns instructions printed before a non-zero exit, and throws stderr-only failures", async () => {
     const { tools } = await load()
-    expect((await call(tools, "memo_wake", {})).content).toBe("Cannot wake: compress first.")
+    await expect(call(tools, "memo_wake", {})).rejects.toThrow("Cannot read scoped OptMem store")
+    expect((await call(tools, "memo_wake", { scope: "all" })).content).toBe("Cannot wake: compress first.")
 
     const dies = join(root, "dies")
     writeFileSync(dies, `#!/bin/sh\necho "No memory at x." >&2\nexit 1\n`)

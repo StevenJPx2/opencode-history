@@ -75,7 +75,7 @@ describe("scoped wake", () => {
     expect(view(store, [GLOBAL, "beta"], 96)).toEqual(["#0 2026-10-12 alpha", "#2 2026-10-12 gamma"])
   })
 
-  test("a mostly in-scope block stands for itself, and a mixed one splits", () => {
+  test("a fully in-scope block stands for itself, and a mixed one splits", () => {
     // [0,2) is global + beta, [2,4) is alpha + alpha, [4,6) is beta + alpha,
     // [6,8) is global + beta: two halves in scope by half, one whole.
     const store = seed(
@@ -98,6 +98,20 @@ describe("scoped wake", () => {
       "#5 2026-10-12 six",
       "#6 2026-10-12 seven",
     ])
+  })
+
+  test("never emits a mixed summary even when 75 percent is in scope", () => {
+    const store = seed([
+      { text: "one", scope: "alpha" },
+      { text: "two", scope: "alpha" },
+      { text: "three", scope: "alpha" },
+      { text: "secret beta", scope: "beta" },
+    ], { 2: ["alpha pair", "alpha plus secret beta"], 4: ["mostly alpha but secret beta"] })
+
+    const lines = view(store, ["alpha"], 2)
+
+    expect(lines.join("\n")).not.toContain("secret beta")
+    expect(lines).toEqual(["#0-1 alpha pair", "#2 2026-10-12 three"])
   })
 
   test("splits a block whose summary is not built instead of refusing", () => {

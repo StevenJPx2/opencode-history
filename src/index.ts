@@ -8,6 +8,9 @@
 // default, and `memo_wake` renders the store's own tree filtered to that
 // project plus `global`. Any memory stays reachable through `memo_recall` and
 // `memo_zoom`, so nothing is lost to a session that never worked on it.
+//
+// Blocks due for a summary are compressed in the background by a cheap model,
+// so no session has to answer them.
 
 import { Plugin } from "@opencode/plugin"
 import { execFile } from "node:child_process"
@@ -18,10 +21,55 @@ import { join } from "node:path"
 import { Registry } from "./registry.ts"
 import { renderWake } from "./render.ts"
 import { GLOBAL, Store, readSizes } from "./store.ts"
+import { Compressor, runnable, type Model } from "./worker.ts"
 import { matches, scopedView, type Relevant } from "./wake.ts"
+import { setupUnified } from "./unified.ts"
 
 const INSTALL = "curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh"
 const TOOL_NAMES = ["memo_wake", "memo_note", "memo_nap", "memo_recall", "memo_zoom", "memo_forget", "memo_scope"]
+
+/** Primary model and free fallback for background compression. */
+const DEFAULT_MODEL = "openai/gpt-6-luna#xhigh"
+const DEFAULT_FALLBACK_MODEL = "opencode/mimo-v2.6-flash-free"
+const DEFAULT_BACKSTOP_SECONDS = 300
+const DEFAULT_DELAY_MS = 2_000
+const BLOCKS_PER_PASS = 8
+const ATTEMPTS_PER_BLOCK = 3
+
+/** `provider/id#variant`, or an explicit reference. */
+export function modelRef(option: unknown, fallback = DEFAULT_MODEL): Model {
+  if (typeof option !== "string") {
+    if (option && typeof option === "object") {
+      const { providerID, id, variant } = option as { providerID?: unknown; id?: unknown; variant?: unknown }
+      if (typeof providerID === "string" && typeof id === "string") {
+        return { providerID, id, ...(typeof variant === "string" ? { variant } : {}) }
+      }
+    }
+
+    return modelRef(fallback, "")
+  }
+
+  const slash = option.indexOf("/")
+  if (slash === -1) return { providerID: option, id: "" }
+
+  const selector = option.slice(slash + 1)
+  const hash = selector.indexOf("#")
+  const id = hash === -1 ? selector : selector.slice(0, hash)
+  const variant = hash === -1 ? undefined : selector.slice(hash + 1)
+
+  return { providerID: option.slice(0, slash), id, ...(variant ? { variant } : {}) }
+}
+
+function modelName(model: Model): string {
+  return `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
+}
+
+function positive(option: unknown, fallback: number): number {
+  return typeof option === "number" && Number.isInteger(option) && option > 0 ? option : fallback
+}
+
+/** One startup line per process, however many times the plugin is set up. */
+let announced = false
 const BLOCK = {
   type: "string",
   pattern: "^\\d+-\\d+$",
@@ -64,7 +112,9 @@ in your wake; they are one memo_recall away, and memo_zoom opens any of them
 whole. Every wake names its scope, so you know how much of the store you hold.
 
 memo_note records under this project unless you pass scope: "global" for
-something true everywhere, or a comma-separated list such as
+enduring user preferences relevant to every project. Project incidents and
+general tool/platform findings belong to their project, not global. Use a
+comma-separated list such as
 scope: "orchestrator,feeds" when it belongs to several. memo_scope moves a
 memory you recorded under the wrong scope. Do not re-note what already exists.
 
@@ -75,7 +125,8 @@ something new, or something worth keeping happens. That covers a task
 worth real effort, a fact or insight the user teaches you, anything you
 learn about their life (even indirectly), any event of lasting effect.
 
-If memo_note asks a compression: do it with memo_nap before your next action.
+Due blocks are compressed in the background. If compression is disabled or
+the worker leaves a block pending, you can answer it with memo_nap.
 
 Never edit or delete anything under \`${data}\`: the tools manage it.
 
@@ -92,6 +143,10 @@ down to the raw memories.`
 export default Plugin.define({
   id: "optmem",
   async setup(ctx) {
+    if (ctx.options.mode === "unified") {
+      const models = [modelRef(ctx.options.model), ...(ctx.options.fallbackModel === false ? [] : [modelRef(ctx.options.fallbackModel,DEFAULT_FALLBACK_MODEL)])]
+      return setupUnified(ctx,models)
+    }
     const memo = expand(typeof ctx.options.memo === "string" ? ctx.options.memo : "~/.optmem/memo")
     const memoryDir = expand(
       typeof ctx.options.memoryDir === "string"
@@ -104,6 +159,52 @@ export default Plugin.define({
     // shares one scope.
     const watch = Registry.load(memoryDir).keyFor(ctx.location.project.canonical)
     const scopes = [GLOBAL, watch]
+    const compressing = existsSync(memo) && ctx.options.compression !== false
+    const log = (message: string) => console.log(`[optmem] ${message}`)
+    const primary = modelRef(ctx.options.model)
+    const fallback = ctx.options.fallbackModel === false
+      ? undefined
+      : modelRef(ctx.options.fallbackModel, DEFAULT_FALLBACK_MODEL)
+    const configured = [primary, ...(fallback === undefined ? [] : [fallback])].filter(
+      (model, index, all) => all.findIndex((other) => modelName(other) === modelName(model)) === index,
+    )
+
+    // Skip configured models which OpenCode cannot resolve, retaining the
+    // configured order so the primary always gets first refusal.
+    async function available(): Promise<Model[]> {
+      try {
+        const listed = (await ctx.model.list()).data
+        const usable = configured.filter((model) => runnable(listed, model))
+
+        for (const model of configured) {
+          if (!usable.some((entry) => modelName(entry) === modelName(model))) {
+            log(`skipping unavailable compression model ${modelName(model)}`)
+          }
+        }
+
+        return usable
+      } catch (error) {
+        log(`cannot list models (${error}); will try configured models in order`)
+        return configured
+      }
+    }
+
+    const models = compressing ? await available() : []
+
+    if (compressing && models.length === 0) {
+      log("background compression off: none of the configured models are available")
+    }
+
+    const compressor = models.length > 0
+      ? new Compressor({
+          call: (args) => run(args),
+          ask: async (prompt, model) => (await ctx.generate.text({ model, prompt })).text,
+          log,
+          models,
+          perPass: positive(ctx.options.blocksPerPass, BLOCKS_PER_PASS),
+          attempts: positive(ctx.options.attemptsPerBlock, ATTEMPTS_PER_BLOCK),
+        })
+      : undefined
 
     function isSubagent(sessionID: string): Promise<boolean> {
       let known = parents.get(sessionID)
@@ -120,18 +221,17 @@ export default Plugin.define({
       return known
     }
 
-    /** Runs `memo` and returns its output, or throws with what it printed. */
-    async function call(args: string[], context: { sessionID: string; signal: AbortSignal }): Promise<string> {
-      if (await isSubagent(context.sessionID)) {
-        throw new Error("You are a subagent. Don't run memo: only the top-level session records memories.")
+    /** Runs `memo` and returns its output, whether or not it exited zero. */
+    function run(args: string[], signal?: AbortSignal): Promise<string> {
+      if (!existsSync(memo)) {
+        return Promise.reject(new Error(`OptMem is not installed at ${pretty(memo)}. Ask the user to run: ${INSTALL}`))
       }
-      if (!existsSync(memo)) throw new Error(`OptMem is not installed at ${pretty(memo)}. Ask the user to run: ${INSTALL}`)
 
       return new Promise<string>((resolve, reject) => {
         execFile(
           memo,
           args,
-          { env: { ...process.env, MEMORY_DIR: memoryDir }, signal: context.signal, timeout: 30_000, maxBuffer: 4 << 20 },
+          { env: { ...process.env, MEMORY_DIR: memoryDir }, signal, timeout: 30_000, maxBuffer: 4 << 20 },
           (error, stdout, stderr) => {
             const output = [stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join("\n")
             // wake and nap exit 1 with instructions on stdout; that is output, not failure.
@@ -140,6 +240,15 @@ export default Plugin.define({
           },
         )
       })
+    }
+
+    /** `run`, once the caller is known to be a top-level session. */
+    async function call(args: string[], context: { sessionID: string; signal: AbortSignal }): Promise<string> {
+      if (await isSubagent(context.sessionID)) {
+        throw new Error("You are a subagent. Don't run memo: only the top-level session records memories.")
+      }
+
+      return run(args, context.signal)
     }
 
     /** The scope keys of `text`, validated against the registry. */
@@ -159,19 +268,19 @@ export default Plugin.define({
       return keys
     }
 
-    /** The view for this session, falling back to memo's own when the store is not ours to read. */
+    /** The scoped view must never fall back to an unfiltered global wake. */
     async function view(
       part: number | undefined,
       snapshot: number | undefined,
       context: { sessionID: string; signal: AbortSignal },
     ): Promise<{ content: string }> {
+      if (!existsSync(memo)) throw new Error(`OptMem is not installed at ${pretty(memo)}`)
+      if (await isSubagent(context.sessionID)) throw new Error("You are a subagent. Don't run memo.")
+
       const store = Store.open(memoryDir)
 
       if (store === undefined) {
-        const args = ["wake"]
-        if (part !== undefined) args.push(String(part))
-        if (snapshot !== undefined) args.push(String(snapshot))
-        return { content: await call(args, context) }
+        throw new Error(`Cannot read scoped OptMem store at ${pretty(memoryDir)}. Use scope: "all" only if you want an unfiltered wake.`)
       }
 
       try {
@@ -181,9 +290,9 @@ export default Plugin.define({
         const relevant: Relevant = (i) => matches(store.scope(i), scopes)
         const rendered = scopedView(store, relevant, sizes.wakeLines)
 
-        // No pending-compression footer: memo's own prompt quotes the raw
-        // memories of the block it wants compressed, which can be another
-        // project's. memo_note still surfaces it, where it is written.
+        // No pending-compression footer: memo's prompt quotes the raw memories
+        // of the next global block, which can belong to another project. The
+        // background worker handles that queue independently.
         return {
           content: renderWake({
             lines: rendered.lines,
@@ -239,8 +348,8 @@ export default Plugin.define({
         name: "memo_note",
         description:
           "Record one memory in OptMem: one line, at most 280 bytes, scoped to this project unless you pass a scope. " +
-          "Use whenever you learn something new or something worth keeping happens. " +
-          "If the result asks for a compression, do it with memo_nap before your next action.",
+          "Use whenever you learn something new or something worth keeping happens. Due blocks are compressed in the background; " +
+          "if compression is disabled or a block stays pending, answer it with memo_nap.",
         input: {
           type: "object",
           properties: {
@@ -268,6 +377,11 @@ export default Plugin.define({
               store.close()
             }
           }
+
+          // A note is what makes a block due, so it is the trigger worth
+          // reacting to; the backstop covers another session's notes. Notes
+          // often come in bursts, so waits are collapsed into one pass.
+          compressor?.schedule(positive(ctx.options.compressDelayMs, DEFAULT_DELAY_MS))
 
           return { content }
         },
@@ -385,5 +499,24 @@ export default Plugin.define({
       }
       event.system.push({ type: "text", text: prompt })
     })
+
+    if (compressor === undefined) return
+
+    // A backstop, because a block can also fall due from another session's
+    // notes, and nothing here would otherwise notice. A pass with nothing
+    // pending is one cheap `memo nap` call.
+    const backstop = positive(ctx.options.backstopSeconds, DEFAULT_BACKSTOP_SECONDS) * 1_000
+    const timer = setInterval(() => void compressor.pass(), backstop)
+    timer.unref?.()
+
+    if (!announced) {
+      announced = true
+      log(`background compression on, models ${models.map(modelName).join(" -> ")}, backstop ${backstop / 1000}s`)
+    }
+
+    return () => {
+      clearInterval(timer)
+      compressor.stop()
+    }
   },
 })
