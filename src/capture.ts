@@ -1,4 +1,8 @@
-import { execFile } from "node:child_process"
+import { spawn } from "node:child_process"
+import { closeSync, mkdirSync, openSync, readFileSync, rmSync } from "node:fs"
+import { randomUUID } from "node:crypto"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { Archive, digest, type Evidence } from "./archive.ts"
 import { recordAudit } from "./audit.ts"
 import { transcriptText } from "./passages.ts"
@@ -49,13 +53,30 @@ export function importTranscript(archive: Archive, project: string, raw: string,
   return added
 }
 
-/** CLI export is the documented full-history API; context is not a substitute. */
-export function exportTranscript(executable: string, sessionID: string, directory: string, signal: AbortSignal, server?: string): Promise<string> {
-  return new Promise((resolve,reject) => execFile(executable,["session","export",sessionID,...server ? ["--server",server] : []],
-    {cwd:directory,signal,timeout:60_000,maxBuffer:128<<20},(error,stdout) => {
-      if (error) reject(new Error("Full transcript export failed"))
-      else resolve(stdout)
-    }))
+/**
+ * CLI export is the documented full-history API; context is not a substitute.
+ *
+ * The child writes into a real file rather than a pipe: the CLI truncates its
+ * own output on a pipe, which silently loses the tail of long conversations.
+ */
+export async function exportTranscript(executable: string, sessionID: string, directory: string, signal: AbortSignal, server?: string, spool = tmpdir()): Promise<string> {
+  const file = join(spool, `optmem-export-${process.pid}-${randomUUID()}.json`)
+  mkdirSync(spool, {recursive:true, mode:0o700})
+  // Transcripts can hold anything the user typed: owner-only, removed on the way out.
+  const handle = openSync(file, "wx", 0o600)
+  try {
+    const code = await new Promise<number|null>((resolve,reject) => {
+      const child = spawn(executable, ["session","export",sessionID,...server ? ["--server",server] : []],
+        {cwd:directory, stdio:["ignore",handle,"ignore"], signal, timeout:60_000, killSignal:"SIGKILL"})
+      child.on("error", reject)
+      child.on("close", exit => resolve(exit))
+    })
+    if (code !== 0) throw new Error("Full transcript export failed")
+    return readFileSync(file, "utf8")
+  } catch {
+    // Never let CLI output or detail reach the log or the audit feed.
+    throw new Error("Full transcript export failed")
+  } finally { closeSync(handle); rmSync(file, {force:true}) }
 }
 
 export class CaptureQueue {
