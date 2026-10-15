@@ -50,6 +50,8 @@ try {
     { id: "u", type: "user", text: "Remember our isolated test decision.", time: { created: 10 } },
     { id: "a", type: "assistant", content: [{ type: "text", text: "Decision confirmed: this isolated fixture uses SQLite WAL mode." }], time: { created: 11, completed: 12 } },
   ] }), parent.id)
+  // Session creation alone does not activate location plugins on every host.
+  api("GET", "/api/plugin")
   // The staged plugin, not this script, must create the child through its real
   // host context. This catches differences between HTTP and plugin methods.
   let children: any[] = []
@@ -60,6 +62,7 @@ try {
     if (children.length) break
     await Bun.sleep(1000)
   }
+  if (!children.length) console.log("Isolated queue:", JSON.stringify(archive.db.query("SELECT phase,state,error FROM jobs").all()), "worker:", archive.status().worker)
   assert(children.length === 1, "real plugin host creates one linked historian child")
   assert(children[0].parentID === parent.id, "host preserves parentID rather than silently ignoring it")
   const roots = api("GET", "/api/session?parentID=null&limit=50")
