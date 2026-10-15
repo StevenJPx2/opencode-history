@@ -3,7 +3,7 @@
 // every plugin instance (one per open project) backs off together instead of
 // each hammering a provider that is down or rate-limited.
 import type { Archive } from "./archive.ts"
-import { GenerationCancelled, GenerationInterrupted, GenerationUnavailable } from "./errors.ts"
+import { GenerationCancelled, GenerationDeferred, GenerationInterrupted, GenerationUnavailable } from "./errors.ts"
 
 export interface Model { providerID: string; id: string; variant?: string }
 export type Call = (model: Model, prompt: string, signal: AbortSignal) => Promise<string>
@@ -53,6 +53,7 @@ export class Generator {
         return text
       } catch (error) {
         if (signal.aborted) throw new GenerationCancelled()
+        if (error instanceof GenerationDeferred) throw error
 
         const failure = classify(error)
         if (failure.kind === "interrupted") throw new GenerationInterrupted()

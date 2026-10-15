@@ -16,7 +16,7 @@ export type ContextEvent = {
 }
 
 export interface SessionRecord {
-  created: Array<{ id: string; title?: string; model?: { providerID: string; id: string; variant?: string } }>
+  created: Array<{ id: string; title?: string; parentID?: string; model?: { providerID: string; id: string; variant?: string } }>
   archived: string[]
   removed: string[]
   generated: Array<{ sessionID: string; prompt: string }>
@@ -83,19 +83,25 @@ export async function startHost(options: {
     },
     session: {
       hook: async (name: string, callback: typeof hook) => { if (name === "context") hook = callback },
-      create: async (input: { title?: string; model?: { providerID: string; id: string; variant?: string } }) => {
+      create: async (input: { title?: string; parentID?: string; model?: { providerID: string; id: string; variant?: string } }) => {
         counter++
         const id = `ses_historian_${counter}`
         created.push(input)
         sessions.created.push({ id, ...input })
-        return { id }
+        return { id, ...input }
       },
       update: async ({ sessionID, time }: { sessionID: string; time?: { archived?: number } }) => {
         if (time?.archived) sessions.archived.push(sessionID)
       },
       remove: async ({ sessionID }: { sessionID: string }) => { sessions.removed.push(sessionID) },
       prompt: async ({ sessionID, text }: { sessionID: string; text: string }) => { sessions.prompted.push({ sessionID, prompt: text }); return {} },
-      get: async () => ({}),
+      list: async () => ({ data: [{ id: "ses_work", title: "Ordinary user work" }] }),
+      context: async () => [],
+      get: async ({ sessionID }: { sessionID: string }) => {
+        const row = sessions.created.find(entry => entry.id === sessionID)
+        if (row) return row
+        throw Object.assign(new Error("not found"), { _tag: "SessionNotFoundError" })
+      },
       generate: async ({ sessionID, prompt }: { sessionID: string; prompt: string }, request?: { signal?: AbortSignal }) => {
         sessions.generated.push({ sessionID, prompt })
         prompts.push(prompt)

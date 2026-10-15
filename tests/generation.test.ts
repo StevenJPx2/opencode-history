@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Archive } from "../src/archive.ts"
 import { importTranscript } from "../src/capture.ts"
-import { GenerationCancelled, GenerationInterrupted, GenerationUnavailable } from "../src/errors.ts"
+import { GenerationCancelled, GenerationDeferred, GenerationInterrupted, GenerationUnavailable } from "../src/errors.ts"
 import { Generator, type Model } from "../src/generator.ts"
 import { removeRoot, startHost } from "./host.ts"
 
@@ -19,7 +19,7 @@ async function until(check: () => boolean, ms = 3000): Promise<boolean> {
   return check()
 }
 
-test("background extraction reaches the model through an archived, empty session", async () => {
+test("background extraction reaches the model through an empty child session", async () => {
   const root = mkdtempSync(join(tmpdir(), "optmem-gen-"))
   const seed = new Archive(join(root, "archive.sqlite"))
   importTranscript(seed, seed.project(join(root, "alpha")), turn, "ses_gen")
@@ -27,10 +27,10 @@ test("background extraction reaches the model through an archived, empty session
   const host = await startHost({ root, models: [{ providerID: "test", id: "model" }], script: { test: [JSON.stringify({ memories: [] })] } })
   try {
     expect(await until(() => host.prompts.length > 0)).toBe(true)
-    // The only session the plugin makes is its own transport: archived on
-    // creation, asked through, and never messaged.
+    // The only session the plugin makes is a child transport, never messaged.
     expect(host.created).toHaveLength(1)
-    expect(host.sessions.archived).toEqual(["ses_historian_1"])
+    expect(host.sessions.created[0]!.parentID).toBe("ses_work")
+    expect(host.sessions.archived).toEqual([])
     expect(host.sessions.prompted).toEqual([])
     expect(host.sessions.generated.map(entry => entry.sessionID)).toEqual(["ses_historian_1"])
   } finally { host.dispose(); await Bun.sleep(20); removeRoot(root) }
@@ -75,6 +75,15 @@ test("a provider outage cools the model down instead of being retried on every j
     clock.now += 61_000
     expect(await ask()).toBe("recovered")
     expect(fake.calls).toEqual(["luna", "luna"])
+  } finally { archive.close() }
+})
+
+test("waiting for a parent does not cool providers down or try the whole chain", async () => {
+  const { archive, fake, ask } = harness([LUNA, HAIKU], { luna: [new GenerationDeferred()], haiku: ["unused"] })
+  try {
+    await expect(ask()).rejects.toBeInstanceOf(GenerationDeferred)
+    expect(fake.calls).toEqual(["luna"])
+    expect(archive.status().cooldowns).toEqual([])
   } finally { archive.close() }
 })
 

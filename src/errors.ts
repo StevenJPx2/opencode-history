@@ -19,3 +19,9 @@ export class GenerationInterrupted extends MemoryError {
 export class GenerationCancelled extends MemoryError {
   constructor() { super("Historian call was cancelled") }
 }
+
+/** No ordinary session exists to parent a hidden historian child yet. */
+export class GenerationDeferred extends MemoryError {
+  readonly until = Date.now() + 30_000
+  constructor() { super("Historian is waiting for a parent session") }
+}

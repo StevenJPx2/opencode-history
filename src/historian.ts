@@ -1,6 +1,6 @@
 import { Archive, MAX_ATTEMPTS, digest, type Evidence, type Job, type Remembered, type Scope } from "./archive.ts"
 import { recordAudit, workerHeartbeat, type AuditOp, type AuditOutcome, type AuditRecord } from "./audit.ts"
-import { GenerationInterrupted, GenerationUnavailable, MemoryError } from "./errors.ts"
+import { GenerationDeferred, GenerationInterrupted, GenerationUnavailable, MemoryError } from "./errors.ts"
 import { redact, worthExtracting } from "./redact.ts"
 import { modelEvidence } from "./passages.ts"
 
@@ -108,14 +108,14 @@ export class Historian {
         // Every model is cooling down: the rest of the queue would fail the same way.
         const settled = this.settle(job, error)
         recordAudit(this.archive, this.entry(job, settled.outcome, startedAt, { count: 0, reason: settled.reason }))
-        if (settled.outcome === "deferred" && error instanceof GenerationUnavailable) return
+        if (settled.outcome === "deferred" && (error instanceof GenerationUnavailable || error instanceof GenerationDeferred)) return
       } finally { clearInterval(pulse) }
     }
   }
 
   /** The archive keeps the provider's own words out; the reason is our fixed text. */
   private settle(job: Job, error: unknown): { outcome: AuditOutcome; reason: string } {
-    if (error instanceof GenerationUnavailable) {
+    if (error instanceof GenerationUnavailable || error instanceof GenerationDeferred) {
       this.archive.defer(job, error.until, error.message)
       return { outcome: "deferred", reason: error.message }
     }

@@ -35,9 +35,11 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   const project = archive.project(ctx.location.project.canonical)
   const embeddings = typeof ctx.options.embeddingURL === "string" ? embeddingService(ctx.options.embeddingURL,option(ctx,"embeddingModel",EMBEDDING_MODEL)) : undefined
   // OpenCode's free tier refuses the sessionless generate route, so the historian
-  // asks through one archived session per model: same text out, still nothing
-  // recorded, and the session never appears in the session list.
+  // asks through one empty child per model, excluded from top-level lists.
+  // The narrow adapter includes parentID, supported by OpenCode v2.0.29 but
+  // missing from the older pinned SDK's SessionCreateInput.
   const sessions = new SessionPool({archive, session: ctx.session as unknown as SessionApi, models, log})
+  await sessions.cleanup()
   const generator = new Generator(archive, models, async (model, prompt, signal) =>
     sessions.ask(model, prompt, `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`, signal))
   const generate = (prompt: string, signal: AbortSignal) => generator.generate(prompt, signal)

@@ -1,14 +1,16 @@
-// The historian's model calls go through sessions: OpenCode's free tier refuses
-// the sessionless generate route, and a session answers without recording a
-// single message. Each model gets one archived session, created once and
-// reused by every plugin instance, deleted when the model leaves the chain.
+// One empty child per model, shared across projects. Children are excluded from
+// OpenCode's top-level session lists; the v2 API does not support archiving.
 import type { Archive } from "./archive.ts"
-import type { Model } from "./generator.ts"
+import { GenerationDeferred } from "./errors.ts"
+import { modelName, type Model } from "./generator.ts"
 
+interface SessionInfo { id: string; title?: string; parentID?: string }
 export interface SessionApi {
-  create(input: { title: string; model: Model }): Promise<{ id: string }>
+  create(input: { title: string; model: Model; parentID: string }): Promise<SessionInfo>
+  list(input: { parentID: string | null; limit: number }): Promise<{ data: SessionInfo[] }>
+  get(input: { sessionID: string }): Promise<SessionInfo>
+  context(input: { sessionID: string }): Promise<readonly unknown[]>
   generate(input: { sessionID: string; prompt: string }, requestOptions?: { signal?: AbortSignal }): Promise<{ text: string }>
-  update(input: { sessionID: string; time?: { archived?: number } }): Promise<unknown>
   remove(input: { sessionID: string }): Promise<unknown>
 }
 
@@ -17,87 +19,114 @@ export interface SessionPoolOptions {
   session: SessionApi
   models: readonly Model[]
   log(message: string): void
-  /** Overrides the clock, for tests. */
-  now?: () => number
 }
 
-const TITLE = "optmem historian"
-const KEY = "historian:session"
+const TITLE = "optmem historian: "
+const LEGACY_KEY = "historian:session"
+const KEY = "historian:children"
+const missing = (error: unknown) => (error as { _tag?: unknown } | null)?._tag === "SessionNotFoundError"
 
 export class SessionPool {
-  private readonly known = new Map<string, string>()
+  constructor(private readonly options: SessionPoolOptions) {}
 
-  constructor(private readonly options: SessionPoolOptions) {
-    for (const [key, value] of Object.entries(this.read())) this.known.set(key, value)
-    // A model that left the chain must not leave an empty session behind.
-    void this.reap()
-  }
-
-  /** Ask one model through its own archived session. */
   async ask(model: Model, prompt: string, name: string, signal: AbortSignal): Promise<string> {
+    signal.throwIfAborted()
     const sessionID = await this.sessionFor(model, name)
-    // The signal reaches the model call, so a reload can interrupt it.
+    signal.throwIfAborted()
     return (await this.options.session.generate({ sessionID, prompt }, { signal })).text
   }
 
   private async sessionFor(model: Model, name: string): Promise<string> {
-    const existing = this.known.get(name) ?? this.read()[name]
-    if (existing !== undefined) return this.remember(name, existing)
-
-    const created = await this.options.session.create({ title: `${TITLE}: ${name}`, model })
-    // Archived on arrival: the session is a transport, not a conversation.
-    await this.options.session.update({ sessionID: created.id, time: { archived: (this.options.now ?? Date.now)() } })
-
-    // Another instance may have created one while this one was running. Keep a
-    // single session per model: the loser deletes its own and adopts the winner's.
-    const winner = this.read()[name]
-    if (winner !== undefined && winner !== created.id) {
-      await this.options.session.remove({ sessionID: created.id }).catch(() => undefined)
-      return this.remember(name, winner)
-    }
-    this.remember(name, created.id)
-    this.options.log(`historian session ready for ${name}`)
-    return created.id
-  }
-
-  /** Deletes sessions for models that are no longer configured. */
-  async reap(): Promise<void> {
-    const wanted = new Set(this.options.models.map(modelName))
-    for (const [name, sessionID] of [...this.known]) {
-      if (wanted.has(name)) continue
-      this.known.delete(name)
-      this.forget(name)
+    const existing = this.read(KEY)[name]
+    if (existing) {
       try {
-        await this.options.session.remove({ sessionID })
+        const info = await this.options.session.get({ sessionID: existing })
+        if (info.parentID && info.title === TITLE + name && !(await this.options.session.context({ sessionID: existing })).length) return existing
+        // Do not send evidence into an unrelated or user-modified session.
+        this.forget(KEY, name, existing)
       } catch (error) {
-        // Already gone is the expected case; never block setup on cleanup.
-        this.options.log(`could not remove the historian session for ${name}`)
-        void error
+        if (!missing(error)) throw error
+        this.forget(KEY, name, existing)
       }
     }
+
+    const listed = await this.options.session.list({ parentID: null, limit: 50 })
+    const parent = listed.data.find(row => !row.parentID && !row.title?.startsWith(TITLE))
+    if (!parent) throw new GenerationDeferred()
+
+    // Create a linked child, not a fork: none of the parent's history is copied.
+    const created = await this.options.session.create({ title: TITLE + name, model, parentID: parent.id })
+    if (created.parentID !== parent.id) {
+      // Fail closed if an older host ignores the parentID, as it did time.archived.
+      await this.options.session.remove({ sessionID: created.id })
+      throw new GenerationDeferred()
+    }
+
+    // Remote creation can race. Publish atomically; the loser deletes only its
+    // own empty child and adopts the winner, including across plugin processes.
+    const winner = this.options.archive.db.transaction(() => {
+      const rows = this.read(KEY)
+      if (rows[name]) return rows[name]
+      this.write(KEY, { ...rows, [name]: created.id })
+      return created.id
+    }).immediate()
+    if (winner !== created.id) {
+      // Keep a durable cleanup entry if the server cannot remove it yet.
+      this.options.archive.db.transaction(() => {
+        this.write(LEGACY_KEY, { ...this.read(LEGACY_KEY), [created.id]: created.id })
+      }).immediate()
+      await this.removeOwned(LEGACY_KEY, created.id, created.id, TITLE + name)
+    }
+    return winner
   }
 
-  private remember(name: string, sessionID: string): string {
-    this.known.set(name, sessionID)
+  /** Only remove owned, empty sessions. Never delete by a title search alone. */
+  async cleanup(): Promise<void> {
+    for (const [name, id] of Object.entries(this.read(LEGACY_KEY))) {
+      // Race losers are keyed by id; older root sessions were keyed by model.
+      await this.removeOwned(LEGACY_KEY, name, id, name.startsWith("ses_") ? undefined : TITLE + name)
+    }
+    const wanted = new Set(this.options.models.map(modelName))
+    for (const [name, id] of Object.entries(this.read(KEY))) {
+      if (!wanted.has(name)) await this.removeOwned(KEY, name, id, TITLE + name)
+    }
+  }
+
+  private async removeOwned(key: string, name: string, id: string, title?: string): Promise<void> {
+    try {
+      const info = await this.options.session.get({ sessionID: id })
+      if (title ? info.title !== title : !info.title?.startsWith(TITLE)) return
+      if ((await this.options.session.context({ sessionID: id })).length) return
+      if ((await this.options.session.list({ parentID: id, limit: 1 })).data.length) return
+      await this.options.session.remove({ sessionID: id })
+      this.forget(key, name, id)
+    } catch (error) {
+      if (missing(error)) this.forget(key, name, id)
+      else this.options.log("historian session cleanup deferred; will retry")
+    }
+  }
+
+  private forget(key: string, name: string, id: string): void {
+    this.options.archive.db.transaction(() => {
+      const rows = this.read(key)
+      if (rows[name] !== id) return
+      delete rows[name]
+      this.write(key, rows)
+    }).immediate()
+  }
+
+  private write(key: string, rows: Record<string, string>): void {
     this.options.archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-      .run(KEY, JSON.stringify({ ...this.read(), [name]: sessionID }))
-    return sessionID
+      .run(key, JSON.stringify(rows))
   }
 
-  private forget(name: string): void {
-    const { [name]: _dropped, ...rest } = this.read()
-    this.options.archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
-      .run(KEY, JSON.stringify(rest))
-  }
-
-  private read(): Record<string, string> {
-    const value = this.options.archive.db.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key=?").get(KEY)?.value
+  private read(key: string): Record<string, string> {
+    const value = this.options.archive.db.query<{ value: string }, [string]>("SELECT value FROM meta WHERE key=?").get(key)?.value
     if (!value) return {}
     try {
-      const parsed = JSON.parse(value) as Record<string, unknown>
+      const parsed: unknown = JSON.parse(value)
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {}
       return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
     } catch { return {} }
   }
 }
-
-const modelName = (model: Model) => `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`

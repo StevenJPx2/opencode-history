@@ -22,7 +22,7 @@ const turn = JSON.stringify({ info: { id: "ses_chain" }, messages: [
 /** The plugin's own context, with a model list and a generate double that records. */
 function context(root: string, options: Record<string, unknown>, ask: (model: string) => Promise<string>) {
   const asked: string[] = []
-  const sessions: Array<{ id: string; model?: { providerID: string; id: string; variant?: string } }> = []
+  const sessions: Array<{ id: string; title: string; parentID: string; model?: { providerID: string; id: string; variant?: string } }> = []
   const name = (model: { providerID: string; id: string; variant?: string }) =>
     `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
   const ctx = {
@@ -31,10 +31,10 @@ function context(root: string, options: Record<string, unknown>, ask: (model: st
     model: { list: async () => ({ data: LISTED }) },
     tool: { transform: async (callback: (editor: { add: (tool: unknown) => void }) => void) => callback({ add: () => undefined }) },
     session: {
-      create: async (input: { title: string; model: { providerID: string; id: string; variant?: string } }) => {
+      create: async (input: { title: string; parentID: string; model: { providerID: string; id: string; variant?: string } }) => {
         const id = `ses_${sessions.length + 1}`
-        sessions.push({ id, model: input.model })
-        return { id }
+        sessions.push({ id, ...input })
+        return { id, ...input }
       },
       update: async () => undefined,
       remove: async () => undefined,
@@ -45,7 +45,13 @@ function context(root: string, options: Record<string, unknown>, ask: (model: st
         return { text: await ask(model) }
       },
       hook: async () => undefined,
-      get: async () => ({}),
+      list: async () => ({ data: [{ id: "ses_work", title: "Ordinary work" }] }),
+      context: async () => [],
+      get: async ({ sessionID }: { sessionID: string }) => {
+        const row = sessions.find(entry => entry.id === sessionID)
+        if (!row) throw Object.assign(new Error("not found"), { _tag: "SessionNotFoundError" })
+        return row
+      },
       prompt: async () => ({}),
     },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) { await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })) } },

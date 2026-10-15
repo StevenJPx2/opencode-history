@@ -1,124 +1,190 @@
-// The historian asks its model through a session: one per model, archived on
-// creation, never messaged, reused across calls, and deleted when a model
-// leaves the chain.
+// External session API seam, including the real root-list filtering contract.
 import { expect, test } from "bun:test"
-import { mkdtempSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { Archive } from "../src/archive.ts"
-import { importTranscript } from "../src/capture.ts"
-import { removeRoot, startHost } from "./host.ts"
+import { SessionPool } from "../src/sessions.ts"
 
-const turn = JSON.stringify({ info: { id: "ses_pool" }, messages: [
-  { id: "u", type: "user", text: "Shall the historian keep a session per model?", time: { created: 10 } },
-  { id: "a", type: "assistant", content: [{ type: "text", text: "Decision confirmed: the historian keeps one archived session per model." }], time: { created: 11, completed: 12 } },
-] })
+const MODEL = { providerID: "opencode", id: "space-bunny-free", variant: "low" }
+const NAME = "opencode/space-bunny-free#low"
+const signal = () => new AbortController().signal
 
-const LUNA = { providerID: "openai", id: "gpt-6-luna", variant: "xhigh" }
-const BUNNY = { providerID: "opencode", id: "space-bunny-free" }
-const silence = JSON.stringify({ memories: [] })
-
-async function until(check: () => boolean, ms = 3000): Promise<boolean> {
-  const deadline = Date.now() + ms
-  while (Date.now() < deadline && !check()) await Bun.sleep(10)
-  return check()
+function service() {
+  const rows = new Map<string, { id: string; title: string; parentID?: string; messages: string[] }>([
+    ["ses_user", { id: "ses_user", title: "Real work", messages: ["private user conversation"] }],
+  ])
+  const created: Array<{ id: string; parentID?: string }> = []
+  const removed: string[] = []
+  const calls: string[] = []
+  let serial = 0
+  const missing = () => Object.assign(new Error("not found"), { _tag: "SessionNotFoundError" })
+  const session = {
+    list: async ({ parentID }: { parentID: string | null } = { parentID: null }) => ({ data: [...rows.values()].filter(row => parentID === null ? !row.parentID : row.parentID === parentID) }),
+    get: async ({ sessionID }: { sessionID: string }) => {
+      const row = rows.get(sessionID)
+      if (!row) throw missing()
+      return row
+    },
+    context: async ({ sessionID }: { sessionID: string }) => {
+      const row = rows.get(sessionID)
+      if (!row) throw missing()
+      return row.messages
+    },
+    create: async (input: { title: string; parentID?: string }) => {
+      if (input.parentID && !rows.has(input.parentID)) throw missing()
+      const id = `ses_child_${++serial}`
+      rows.set(id, { ...input, id, messages: [] })
+      created.push({ id, ...(input.parentID ? { parentID: input.parentID } : {}) })
+      return { id, ...(input.parentID ? { parentID: input.parentID } : {}) }
+    },
+    generate: async ({ sessionID }: { sessionID: string }) => {
+      if (!rows.has(sessionID)) throw missing()
+      calls.push(sessionID)
+      return { text: "OK" }
+    },
+    remove: async ({ sessionID }: { sessionID: string }) => {
+      if (!rows.delete(sessionID)) throw missing()
+      removed.push(sessionID)
+    },
+  }
+  return { rows, created, removed, calls, session }
 }
 
-function seeded(): string {
-  const root = mkdtempSync(join(tmpdir(), "optmem-pool-"))
-  const archive = new Archive(join(root, "archive.sqlite"))
-  importTranscript(archive, archive.project(join(root, "alpha")), turn, "ses_pool")
-  archive.close()
-  return root
-}
-
-test("the historian asks through a session and never through the stateless route", async () => {
-  const root = seeded()
-  const host = await startHost({ root, models: [LUNA], script: { "openai/gpt-6-luna#xhigh": [silence, silence] } })
+test("historian children stay out of the root list and never copy parent messages", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  const pool = new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} })
   try {
-    expect(await until(() => host.sessions.generated.length > 0, 500)).toBe(true)
-    expect(host.sessions.errors).toEqual([])
-    expect(host.stateless).toBe(0)
-    expect(host.sessions.prompted).toEqual([])
-    expect(host.sessions.created).toHaveLength(1)
-    expect(host.sessions.created[0]!.title).toContain("optmem")
-  } finally { host.dispose(); await Bun.sleep(20); removeRoot(root) }
+    expect(await pool.ask(MODEL, "redacted evidence", NAME, signal())).toBe("OK")
+    expect(host.created).toEqual([{ id: "ses_child_1", parentID: "ses_user" }])
+    expect((await host.session.list()).data.map(row => row.id)).toEqual(["ses_user"])
+    expect(host.rows.get("ses_child_1")!.messages).toEqual([])
+  } finally { archive.close() }
 })
 
-test("each model gets its own session, archived on creation, and only one", async () => {
-  const root = seeded()
-  const host = await startHost({ root, models: [LUNA, BUNNY], script: {
-    "openai/gpt-6-luna#xhigh": [Object.assign(new Error("usage limit"), { _tag: "RateLimitError" })],
-    "opencode/space-bunny-free": [silence],
-  } })
+test("the same child is reused by another instance and after a reload", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  const options = { archive, session: host.session, models: [MODEL], log: () => {} }
   try {
-    // Luna is asked first and refuses, so the chain needs its own session too.
-    expect(await until(() => host.sessions.created.length === 2, 2000)).toBe(true)
-    expect(host.sessions.created.map(entry => `${entry.model!.providerID}/${entry.model!.id}`)).toEqual([
-      "openai/gpt-6-luna", "opencode/space-bunny-free",
-    ])
-    // Archived the moment each was created: a transport, not a conversation.
-    expect(host.sessions.archived).toEqual(host.sessions.created.map(entry => entry.id))
-    expect(host.sessions.generated.map(entry => entry.sessionID)).toEqual(["ses_historian_1", "ses_historian_2"])
-    expect(host.sessions.prompted).toEqual([])
-    expect(host.stateless).toBe(0)
-  } finally { host.dispose(); await Bun.sleep(20); removeRoot(root) }
+    await new SessionPool(options).ask(MODEL, "first", NAME, signal())
+    await new SessionPool(options).ask(MODEL, "second", NAME, signal())
+    expect(host.created).toHaveLength(1)
+    expect(host.calls).toEqual(["ses_child_1", "ses_child_1"])
+  } finally { archive.close() }
 })
 
-test("a session survives a reload, and one for a model that leaves the chain is deleted", async () => {
-  const root = seeded()
-  const first = await startHost({ root, models: [BUNNY], script: { "opencode/space-bunny-free": [silence] } })
+test("a deleted parent and child are replaced under another real session", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  const pool = new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} })
   try {
-    expect(await until(() => first.sessions.created.length === 1)).toBe(true)
-  } finally { first.dispose(); await Bun.sleep(20) }
-
-  const same = await startHost({ root, directory: join(root, "beta"), models: [BUNNY], script: { "opencode/space-bunny-free": [silence] } })
-  try {
-    // The session id lives in the archive, so a new instance does not create one.
-    expect(same.sessions.created).toEqual([])
-  } finally { same.dispose(); await Bun.sleep(20) }
-
-  const changed = await startHost({ root, directory: join(root, "gamma"), models: [{ providerID: "opencode", id: "mimo-v2.6-flash-free" }], script: { "opencode/mimo-v2.6-flash-free": [silence] } })
-  try {
-    // The bunny model left the chain, so its session is not left behind.
-    expect(await until(() => changed.sessions.removed.includes("ses_historian_1"), 2000)).toBe(true)
-  } finally { changed.dispose(); await Bun.sleep(20); removeRoot(root) }
+    await pool.ask(MODEL, "first", NAME, signal())
+    host.rows.clear() // OpenCode recursively deletes children with their parent.
+    host.rows.set("ses_other", { id: "ses_other", title: "More work", messages: [] })
+    await pool.ask(MODEL, "second", NAME, signal())
+    expect(host.created.at(-1)).toEqual({ id: "ses_child_2", parentID: "ses_other" })
+    expect(host.calls).toEqual(["ses_child_1", "ses_child_2"])
+  } finally { archive.close() }
 })
 
-test("two instances racing for the same model keep one session and delete the other", async () => {
-  const root = seeded()
-  const script = { "opencode/space-bunny-free": [silence, silence, silence, silence, silence, silence] }
-  const alpha = await startHost({ root, models: [BUNNY], script })
-  const beta = await startHost({ root, directory: join(root, "beta"), models: [BUNNY], script })
+test("without a parent, defer rather than create another visible root", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  host.rows.clear()
+  const pool = new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} })
   try {
-    expect(await until(() => alpha.sessions.created.length + beta.sessions.created.length > 0)).toBe(true)
-    const asked = [...alpha.sessions.generated, ...beta.sessions.generated]
-    expect(await until(() => asked.length > 0, 2000)).toBe(true)
-    // Whether or not they raced, every session created is either the one in use
-    // or was deleted again: never a leftover.
-    const created = [...alpha.sessions.created, ...beta.sessions.created]
-    const removed = new Set([...alpha.sessions.removed, ...beta.sessions.removed])
-    const used = new Set(asked.map(entry => entry.sessionID))
-    for (const entry of created) expect(used.has(entry.id) || removed.has(entry.id)).toBe(true)
-    expect(used.size).toBe(1)
-  } finally { alpha.dispose(); beta.dispose(); await Bun.sleep(20); removeRoot(root) }
+    await expect(pool.ask(MODEL, "prompt", NAME, signal())).rejects.toThrow("waiting for a parent session")
+    expect(host.created).toEqual([])
+    expect(host.calls).toEqual([])
+  } finally { archive.close() }
 })
 
-test("every plugin instance shares one session per model", async () => {
-  const root = seeded()
-  const script = { "opencode/space-bunny-free": [silence, silence, silence, silence] }
-  const alpha = await startHost({ root, models: [BUNNY], script })
-  const beta = await startHost({ root, directory: join(root, "beta"), models: [BUNNY], script })
+test("a host that silently ignores parentID cannot leave a visible historian root", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  const session = { ...host.session, create: async ({ title }: { title: string }) => host.session.create({ title }) }
   try {
-    expect(await until(() => alpha.sessions.created.length === 1)).toBe(true)
-    // Fresh evidence, so whichever instance claims it asks through the shared session.
-    const archive = new Archive(join(root, "archive.sqlite"))
-    importTranscript(archive, archive.project(join(root, "gamma")), turn.replace("ses_pool", "ses_pool2"), "ses_pool2")
-    archive.close()
+    await expect(new SessionPool({ archive, session, models: [MODEL], log: () => {} }).ask(MODEL, "p", NAME, signal()))
+      .rejects.toThrow("waiting for a parent session")
+    expect(host.removed).toEqual(["ses_child_1"])
+    expect(host.calls).toEqual([])
+  } finally { archive.close() }
+})
 
-    const asked = () => [...alpha.sessions.generated, ...beta.sessions.generated]
-    expect(await until(() => asked().length > 0, 2000)).toBe(true)
-    expect([...alpha.sessions.created, ...beta.sessions.created]).toHaveLength(1)
-    expect(new Set(asked().map(entry => entry.sessionID))).toEqual(new Set(["ses_historian_1"]))
-  } finally { alpha.dispose(); beta.dispose(); await Bun.sleep(20); removeRoot(root) }
+test("only mapped, empty historian roots are removed during migration", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  host.rows.set("ses_old", { id: "ses_old", title: `optmem historian: ${NAME}`, messages: [] })
+  host.rows.set("ses_used", { id: "ses_used", title: "optmem historian: used", messages: ["keep me"] })
+  host.rows.set("ses_unowned", { id: "ses_unowned", title: "optmem historian: unrelated", messages: [] })
+  archive.db.query("INSERT INTO meta VALUES(?,?)").run("historian:session", JSON.stringify({ [NAME]: "ses_old", used: "ses_used" }))
+  const pool = new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} })
+  try {
+    await pool.cleanup()
+    expect(host.removed).toEqual(["ses_old"])
+    expect(host.rows.has("ses_used")).toBe(true)
+    expect(host.rows.has("ses_unowned")).toBe(true)
+    await pool.ask(MODEL, "prompt", NAME, signal())
+    expect(host.created[0]!.parentID).toBe("ses_user")
+  } finally { archive.close() }
+})
+
+test("cleanup retains the mapping when removal fails so it can be retried", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  host.rows.set("ses_old", { id: "ses_old", title: `optmem historian: ${NAME}`, messages: [] })
+  archive.db.query("INSERT INTO meta VALUES(?,?)").run("historian:session", JSON.stringify({ [NAME]: "ses_old" }))
+  const broken = { ...host.session, remove: async () => { throw new Error("offline") } }
+  try {
+    await new SessionPool({ archive, session: broken, models: [MODEL], log: () => {} }).cleanup()
+    expect(archive.db.query("SELECT value FROM meta WHERE key=?").get("historian:session")).not.toBeNull()
+    await new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} }).cleanup()
+    expect(host.removed).toEqual(["ses_old"])
+  } finally { archive.close() }
+})
+
+test("cleanup never recursively deletes a session with another child", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  host.rows.set("ses_old", { id: "ses_old", title: `optmem historian: ${NAME}`, messages: [] })
+  host.rows.set("ses_nested", { id: "ses_nested", title: "User work", parentID: "ses_old", messages: [] })
+  archive.db.query("INSERT INTO meta VALUES(?,?)").run("historian:session", JSON.stringify({ [NAME]: "ses_old" }))
+  try {
+    await new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} }).cleanup()
+    expect(host.removed).toEqual([])
+  } finally { archive.close() }
+})
+
+test("a child containing user messages is preserved but never reused for model input", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  const pool = new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} })
+  try {
+    await pool.ask(MODEL, "first", NAME, signal())
+    host.rows.get("ses_child_1")!.messages.push("a secret the user typed")
+    await pool.ask(MODEL, "second", NAME, signal())
+    expect(host.calls).toEqual(["ses_child_1", "ses_child_2"])
+    expect(host.rows.has("ses_child_1")).toBe(true)
+  } finally { archive.close() }
+})
+
+test("concurrent instances adopt one child and clean up the losing creation", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  const options = { archive, session: host.session, models: [MODEL], log: () => {} }
+  try {
+    await Promise.all([new SessionPool(options).ask(MODEL, "a", NAME, signal()), new SessionPool(options).ask(MODEL, "b", NAME, signal())])
+    expect(new Set(host.calls).size).toBe(1)
+    expect([...host.rows.values()].filter(row => row.parentID)).toHaveLength(1)
+    expect(host.removed).toHaveLength(host.created.length - 1)
+  } finally { archive.close() }
+})
+
+test("a model removed from the chain leaves no unused child", async () => {
+  const archive = new Archive(":memory:")
+  const host = service()
+  try {
+    await new SessionPool({ archive, session: host.session, models: [MODEL], log: () => {} }).ask(MODEL, "p", NAME, signal())
+    await new SessionPool({ archive, session: host.session, models: [], log: () => {} }).cleanup()
+    expect(host.removed).toEqual(["ses_child_1"])
+  } finally { archive.close() }
 })
