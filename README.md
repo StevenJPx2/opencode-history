@@ -86,7 +86,7 @@ bun run audit                     # the recent operation feed
 bun run audit --follow extract    # stream one kind of event
 ```
 
-- `status` reports whether a worker is beating (and which deployed release it is), how many conversations are queued to export, queued/running/done/failed jobs, grouped failure reasons, and model cooldowns.
+- `status` reports whether a worker is beating (and which deployed release it is), how many conversations are queued to export, queued/running/done/failed jobs, grouped failure reasons, and model cooldowns with the provider's error tag for each.
 - Each operation records an id, an outcome, a count, a duration and a fixed reason. Prompts, passages and tool output are never recorded.
 - The agent can ask the same questions from inside a session with the `memory_status` tool.
 - The feed keeps the last 5000 records and is followable with an exclusive id cursor, so nothing repeats.

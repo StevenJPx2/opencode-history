@@ -91,7 +91,7 @@ test("status reports queue state, failures, cooldowns and the newest capture", a
     ])
     expect(status.jobs).toMatchObject({ failed: 1, pending: 1, done: 0, running: 0 })
     expect(status.failures).toEqual([{ reason: "Memory citation does not match supplied evidence", count: 1 }])
-    expect(status.cooldowns).toEqual([{ model: "openai/luna", until: 5000, failures: 2, kind: "unavailable" }])
+    expect(status.cooldowns).toEqual([{ model: "openai/luna", until: 5000, failures: 2, kind: "unavailable", tag: "unknown" }])
     expect(status.evidence.lastKind).toBe("user")
   } finally { archive.close() }
 })

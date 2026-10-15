@@ -25,7 +25,7 @@ export interface AuditEntry {
 }
 
 export interface FailureSummary { reason: string; count: number }
-export interface CooldownSummary { model: string; until: number; failures: number; kind: string }
+export interface CooldownSummary { model: string; until: number; failures: number; kind: string; tag: string }
 export interface WorkerState { active: boolean; locations: string[]; lastAt: number | null; releases: string[] }
 export interface CaptureState { queued: number; lastAt: number | null; lastError: string | null }
 export interface JobState { pending: number; running: number; done: number; failed: number }
@@ -144,9 +144,10 @@ export function memoryStatus(archive: Archive, options: { at?: number; staleMs?:
     cooldowns: archive.db.query<{ key: string; value: string }, []>("SELECT key,value FROM meta WHERE key LIKE 'cooldown:%'").all()
       .map(({ key, value }): CooldownSummary => {
         try {
-          const parsed = JSON.parse(value) as Partial<{ until: number; failures: number; kind: string }>
-          return { model: key.slice("cooldown:".length), until: Number(parsed.until), failures: Number(parsed.failures), kind: String(parsed.kind) }
-        } catch { return { model: key.slice("cooldown:".length), until: 0, failures: 0, kind: "unknown" } }
+          const parsed = JSON.parse(value) as Partial<{ until: number; failures: number; kind: string; tag: string }>
+          return { model: key.slice("cooldown:".length), until: Number(parsed.until), failures: Number(parsed.failures),
+            kind: String(parsed.kind), tag: String(parsed.tag ?? "unknown") }
+        } catch { return { model: key.slice("cooldown:".length), until: 0, failures: 0, kind: "unknown", tag: "unknown" } }
       }),
   }
 }

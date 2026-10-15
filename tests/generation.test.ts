@@ -107,6 +107,28 @@ test("a rejected model cools down for longer than a transient outage", async () 
   } finally { archive.close() }
 })
 
+test("a model's failure is recorded by tag alone, never by the provider's words", async () => {
+  const leaky = Object.assign(new Error("usage limit reached for account sk-secret-1234"), { _tag: "RateLimitError" })
+  const { archive, clock, ask } = harness([LUNA], { luna: [leaky, "ok"] })
+  try {
+    await expect(ask()).rejects.toBeInstanceOf(GenerationUnavailable)
+    const [cooldown] = archive.status().cooldowns
+    expect(cooldown).toMatchObject({ model: "openai/luna", failures: 1, tag: "RateLimitError" })
+    expect(cooldown!.until).toBe(clock.now + 60_000)
+    // A provider's own words never reach the archive or the status report.
+    expect(JSON.stringify(archive.status().cooldowns)).not.toContain("sk-secret-1234")
+  } finally { archive.close() }
+})
+
+test("a failure with no tag is still recorded as unknown, without its message", async () => {
+  const { archive, ask } = harness([LUNA], { luna: [new Error("key sk-secret-9999 was rejected"), "ok"] })
+  try {
+    await expect(ask()).rejects.toBeInstanceOf(GenerationUnavailable)
+    expect(archive.status().cooldowns).toMatchObject([{ model: "openai/luna", kind: "unavailable", tag: "unknown" }])
+    expect(JSON.stringify(archive.status().cooldowns)).not.toContain("sk-secret-9999")
+  } finally { archive.close() }
+})
+
 test("cooldowns are shared by every plugin instance on the same archive", async () => {
   const archive = new Archive(":memory:")
   const first = provider({ luna: [outage] })

@@ -33,7 +33,7 @@ try {
     console.log(`jobs        ${status.jobs.done} done, ${status.jobs.pending} pending, ${status.jobs.running} running, ${status.jobs.failed} failed`)
     console.log(`evidence    ${status.evidence.count} records, last ${status.evidence.lastKind ?? "none"} ${ago(status.evidence.lastAt)}`)
     console.log(`memories    ${status.memories.count} written, ${status.memories.indexed} indexed, last ${ago(status.memories.lastAt)}`)
-    for (const cooldown of status.cooldowns) console.log(`cooldown    ${cooldown.model} until ${new Date(cooldown.until).toISOString()} (${cooldown.failures} failures)`)
+    for (const cooldown of status.cooldowns) console.log(`cooldown    ${cooldown.model} until ${new Date(cooldown.until).toISOString()} (${cooldown.failures} failures, ${cooldown.tag})`)
     for (const failure of status.failures) console.log(`failed      ${failure.count}x ${failure.reason}`)
   }
 } finally { clearInterval(timer); archive.close() }
