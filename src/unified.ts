@@ -10,7 +10,7 @@ import { Historian, contextBlock, fuse, modelMemory, retrieve } from "./historia
 import { migrateOptMem } from "./migrate.ts"
 import { modelEvidence } from "./passages.ts"
 import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
-import { SessionPool, type SessionApi } from "./sessions.ts"
+import { listSessions, SessionPool, type SessionApi } from "./sessions.ts"
 
 type Context = Plugin.Context
 const option = (ctx: Context, key: string, fallback: string) => typeof ctx.options[key] === "string" ? ctx.options[key] as string : fallback
@@ -38,7 +38,17 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   // asks through one empty child per model, excluded from top-level lists.
   // The narrow adapter includes parentID, supported by OpenCode v2.0.29 but
   // missing from the older pinned SDK's SessionCreateInput.
-  const sessions = new SessionPool({archive, session: ctx.session as unknown as SessionApi, models, log})
+  const api = ctx.session as unknown as SessionApi
+  const sessions = new SessionPool({archive, session: {
+    create: input => api.create(input),
+    get: input => api.get(input),
+    context: input => api.context(input),
+    generate: (input, request) => api.generate(input, request),
+    remove: input => api.remove(input),
+    // HTTP clients expose list, while plugin hosts omit it. Keep the CLI
+    // fallback explicit and authenticated by OpenCode, not by reading secrets.
+    list: input => typeof api.list === "function" ? api.list(input) : listSessions(option(ctx,"opencode","opencode"),ctx.location.directory,input),
+  }, models, log})
   await sessions.cleanup()
   const generator = new Generator(archive, models, async (model, prompt, signal) =>
     sessions.ask(model, prompt, `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`, signal))

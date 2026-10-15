@@ -6,14 +6,18 @@ import { join, resolve } from "node:path"
 
 const release = resolve(process.argv[2] ?? ".")
 const { Archive } = await import(join(release, "src/archive.ts"))
-const { SessionPool } = await import(join(release, "src/sessions.ts"))
+const { importTranscript } = await import(join(release, "src/capture.ts"))
 const root = mkdtempSync("/private/var/folders/tg/n2ghb0wx6x3flzwbvg_t32rw0000gn/T/opencode/optmem-child-smoke-")
 const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined &&
   !key.startsWith("OPENCODE") && !/^(OPENAI|ANTHROPIC|GOOGLE|GEMINI)_API_KEY$/.test(key))) as Record<string, string>
 Object.assign(env, { XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"),
   XDG_STATE_HOME: join(root, "state"), XDG_CACHE_HOME: join(root, "cache") })
 mkdirSync(join(root, "config/opencode"), { recursive: true, mode: 0o700 })
-writeFileSync(join(root, "config/opencode/opencode.jsonc"), JSON.stringify({ plugins: ["-*"], model: "opencode/space-bunny-free" }))
+const config = join(root, "config/opencode/opencode.jsonc")
+const archivePath = join(root, "archive.sqlite")
+writeFileSync(config, JSON.stringify({ plugins: [{ package: release, options: {
+  mode: "unified", archivePath, memoryDir: join(root, "no-legacy"), model: "opencode/space-bunny-free#low", fallbackModel: false,
+} }], model: "opencode/space-bunny-free" }))
 
 function cli(args: string[], timeout = 60_000): string {
   const result = spawnSync("opencode", args, { cwd: root, env, timeout, maxBuffer: 8 << 20, encoding: "utf8" })
@@ -41,32 +45,33 @@ try {
   const model = { providerID: "opencode", id: "space-bunny-free", variant: "low" }
   const parent = api("POST", "/api/session", { title: "OptMem isolated parent", model })
   ids.add(parent.id)
-  archive = new Archive(join(root, "archive.sqlite"))
-  const session = {
-    create: async (input: unknown) => { const row = api("POST", "/api/session", input); ids.add(row.id); return row },
-    list: async ({ parentID, limit }: { parentID: string | null; limit: number }) => ({
-      data: api("GET", `/api/session?parentID=${encodeURIComponent(parentID === null ? "null" : parentID)}&limit=${limit}`),
-    }),
-    get: async ({ sessionID }: { sessionID: string }) => api("GET", `/api/session/${sessionID}`),
-    context: async ({ sessionID }: { sessionID: string }) => api("GET", `/api/session/${sessionID}/message`),
-    generate: async ({ sessionID, prompt }: { sessionID: string; prompt: string }) => api("POST", `/api/session/${sessionID}/generate`, { prompt }),
-    remove: async ({ sessionID }: { sessionID: string }) => { api("DELETE", `/api/session/${sessionID}`); ids.delete(sessionID) },
+  archive = new Archive(archivePath)
+  importTranscript(archive, archive.project(root), JSON.stringify({ info: { id: parent.id }, messages: [
+    { id: "u", type: "user", text: "Remember our isolated test decision.", time: { created: 10 } },
+    { id: "a", type: "assistant", content: [{ type: "text", text: "Decision confirmed: this isolated fixture uses SQLite WAL mode." }], time: { created: 11, completed: 12 } },
+  ] }), parent.id)
+  // The staged plugin, not this script, must create the child through its real
+  // host context. This catches differences between HTTP and plugin methods.
+  let children: any[] = []
+  const deadline = Date.now() + 75_000
+  while (Date.now() < deadline) {
+    children = api("GET", `/api/session?parentID=${parent.id}&limit=50`) ?? []
+    for (const row of children) ids.add(row.id)
+    if (children.length) break
+    await Bun.sleep(1000)
   }
-  const pool = new SessionPool({ archive, session, models: [model], log: () => {} })
-  let generated = false
-  try { generated = (await pool.ask(model, "Reply with the single word OK.", "opencode/space-bunny-free#low", new AbortController().signal)).includes("OK") }
-  catch { console.log("NOTE: isolated free-model generation unavailable; checking lifecycle independently") }
-  const children = (await session.list({ parentID: parent.id, limit: 50 })).data
-  assert(children.length === 1, "one linked historian child exists")
+  assert(children.length === 1, "real plugin host creates one linked historian child")
   assert(children[0].parentID === parent.id, "host preserves parentID rather than silently ignoring it")
-  const roots = (await session.list({ parentID: null, limit: 50 })).data
+  const roots = api("GET", "/api/session?parentID=null&limit=50")
   assert(roots.some((row: { id: string }) => row.id === parent.id) && !roots.some((row: { id: string }) => row.id === children[0].id), "root-session list excludes the historian")
-  assert((await session.context({ sessionID: children[0].id })).length === 0, "historian history remains empty")
-  console.log(`Real generation: ${generated ? "OK" : "unavailable in isolated service"}`)
+  assert(api("GET", `/api/session/${children[0].id}/message`).length === 0, "historian history remains empty")
 } finally {
   archive?.close()
   let clean = true
   if (started) {
+    writeFileSync(config, JSON.stringify({ plugins: ["-*"], model: "opencode/space-bunny-free" }))
+    await Bun.sleep(2000)
+    for (const row of api("GET", "/api/session?limit=100") ?? []) ids.add(row.id)
     for (const sessionID of [...ids].reverse()) {
       try { api("DELETE", `/api/session/${sessionID}`); ids.delete(sessionID) } catch { clean = false }
     }

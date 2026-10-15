@@ -1,6 +1,7 @@
 // One empty child per model, shared across projects. Children are excluded from
 // OpenCode's top-level session lists; the v2 API does not support archiving.
 import type { Archive } from "./archive.ts"
+import { execFile } from "node:child_process"
 import { GenerationDeferred } from "./errors.ts"
 import { modelName, type Model } from "./generator.ts"
 
@@ -25,6 +26,27 @@ const TITLE = "optmem historian: "
 const LEGACY_KEY = "historian:session"
 const KEY = "historian:children"
 const missing = (error: unknown) => (error as { _tag?: unknown } | null)?._tag === "SessionNotFoundError"
+
+/** Plugin hosts lack session.list. The CLI uses the service's stored auth. */
+export function listSessions(executable: string, directory: string, input: { parentID: string | null; limit: number }): Promise<{ data: SessionInfo[] }> {
+  const path = `/api/session?parentID=${encodeURIComponent(input.parentID ?? "null")}&limit=${Math.min(50, Math.max(1, Math.floor(input.limit)))}`
+  return new Promise((resolve, reject) => {
+    execFile(executable, ["api", "GET", path], { cwd: directory, timeout: 15_000, maxBuffer: 4 << 20 }, (error, stdout) => {
+      // Never surface command output or API response details in memory/audit.
+      if (error) { reject(new Error("Historian session listing failed")); return }
+      try {
+        const value: unknown = JSON.parse(stdout)
+        if (!value || typeof value !== "object" || !("data" in value) || !Array.isArray(value.data)) throw new Error()
+        const data = value.data.map((row: unknown): SessionInfo => {
+          if (!row || typeof row !== "object" || !("id" in row) || typeof row.id !== "string") throw new Error()
+          return { id: row.id, ...("title" in row && typeof row.title === "string" ? { title: row.title } : {}),
+            ...("parentID" in row && typeof row.parentID === "string" ? { parentID: row.parentID } : {}) }
+        })
+        resolve({ data })
+      } catch { reject(new Error("Historian session listing failed")) }
+    })
+  })
+}
 
 export class SessionPool {
   constructor(private readonly options: SessionPoolOptions) {}
