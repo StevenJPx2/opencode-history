@@ -15,18 +15,27 @@ OpenCode tools.
 
 ## Install
 
-Install OptMem itself, then point OpenCode at this repository:
+Install OptMem itself, then stage a fixed release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/VictorTaelin/OptMem/main/install.sh | sh
+bun run stage-release
 ```
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugins": ["/path/to/opencode-optmem"]
+  "plugins": ["/absolute/path/printed/by/stage-release"]
 }
 ```
+
+Do not load a working checkout in your daily OpenCode configuration: editing it
+can hot-reload the plugin during active tasks. `stage-release` copies runtime
+files and installs locked dependencies in a separate, content-addressed release.
+It does not activate the release or change an existing one. Switch the configured
+path only for an intentional deployment. Keep the embedding LaunchAgent pointed
+at that release's `tools/embedding-server.py` too, with `uv run --frozen --script`.
+Previous release directories remain available for rollback.
 
 Options, through the object form of the plugin entry:
 
@@ -51,7 +60,9 @@ Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with
 
 - Full session exports are archived in `~/.local/share/optmem/archive.sqlite` (option `archivePath`).
 - Each completed assistant reply, with its turn's user message, goes to the historian model (`model`, then `fallbackModel`). It extracts source-cited memories in the background, or none.
-- Secrets are masked locally before any archived text reaches a model.
+- Historian calls are stateless: they create no OpenCode sessions and add nothing to any session's history.
+- A model that fails cools down (shared by every open project), honouring a provider's retry-after. A job whose model output stays unusable is marked `failed` after five attempts; outages and reloads do not use up attempts.
+- Secrets are masked locally before any archived text or stored memory reaches a model.
 - Each model request gets a bounded block of project and global memories. The `memory` tool asks the historian when that is not enough.
 
 Existing OptMem notes, scopes, summaries and config are imported on startup. The import checks every byte, can be re-run safely, and never writes to the original store.

@@ -9,6 +9,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
+    "stage-release": "bun tools/stage-release.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests",
     "check": "bun run typecheck && bun run test"

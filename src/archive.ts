@@ -36,6 +36,8 @@ export interface Job {
 }
 
 export const digest = (text: string) => createHash("sha256").update(text).digest("hex")
+/** Attempts a job gets for faults of its own before it is marked `failed`. */
+export const MAX_ATTEMPTS = 5
 export type Scope = string | "all"
 export interface Hit { id: string; text: string; kind: string; at: number }
 const bounded = (limit: number) => Number.isFinite(limit) ? Math.min(Math.max(Math.floor(limit), 1), 50) : 12
@@ -147,10 +149,21 @@ export class Archive {
     }).immediate()
   }
 
+  /**
+   * The job's own fault, such as unusable model output: back off, and after
+   * `MAX_ATTEMPTS` mark it `failed` so it stops costing model calls.
+   */
   retry(job: Job, error: string): void {
+    const state = job.attempts >= MAX_ATTEMPTS ? "failed" : "pending"
     const delay = Math.min(3_600_000, 5_000 * 2 ** Math.min(job.attempts, 10))
-    this.db.query("UPDATE jobs SET state='pending',ready=?,token=NULL,lease=0,error=? WHERE id=? AND token=?")
-      .run(Date.now() + delay, error, job.id, job.token)
+    this.db.query("UPDATE jobs SET state=?,ready=?,token=NULL,lease=0,error=? WHERE id=? AND token=?")
+      .run(state, Date.now() + delay, error, job.id, job.token)
+  }
+
+  /** Not the job's fault (a model outage or reload): run it at `ready`, attempt not counted. */
+  defer(job: Job, ready: number, error: string): void {
+    this.db.query("UPDATE jobs SET state='pending',ready=?,attempts=attempts-1,token=NULL,lease=0,error=? WHERE id=? AND token=?")
+      .run(ready, error, job.id, job.token)
   }
 
   /** Keep a lease alive while a model request is in flight. */

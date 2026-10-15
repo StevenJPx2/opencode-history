@@ -4,7 +4,8 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { Archive, digest, type Remembered, type Scope } from "./archive.ts"
 import { CaptureQueue, exportTranscript } from "./capture.ts"
-import { Historian, MemoryError, contextBlock, fuse, retrieve } from "./historian.ts"
+import { Generator } from "./generator.ts"
+import { Historian, contextBlock, fuse, modelMemory, retrieve } from "./historian.ts"
 import { migrateOptMem } from "./migrate.ts"
 import { redact } from "./redact.ts"
 import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
@@ -28,51 +29,10 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   } catch (error) { archive.close(); throw error }
   const project = archive.project(ctx.location.project.canonical)
   const embeddings = typeof ctx.options.embeddingURL === "string" ? embeddingService(ctx.options.embeddingURL,option(ctx,"embeddingModel",EMBEDDING_MODEL)) : undefined
-  // Subscription providers only answer inside a session, which also supplies
-  // a stable prefix for prompt caching. One session per model for the whole
-  // store, shared by every project instance, so the session list stays clean.
-  const isHistorian = (sessionID: string) =>
-    !!archive.db.query("SELECT 1 FROM meta WHERE key LIKE 'historian:%' AND value=?").get(sessionID)
-  async function historianSession(model: {providerID:string;id:string;variant?:string}, signal: AbortSignal): Promise<string> {
-    const key = `historian:${model.providerID}/${model.id}#${model.variant ?? ""}`
-    const saved = archive.db.query<{value:string}, [string]>("SELECT value FROM meta WHERE key=?").get(key)?.value
-    if (saved) {
-      const alive = await ctx.session.get({sessionID:saved as never},{signal}).then(() => true, () => false)
-      if (signal.aborted) throw new MemoryError("Historian cancelled")
-      if (alive) return saved
-    }
-    // Only one instance creates it; the others retry once it exists.
-    const lock = `lock:${key}`
-    const claimed = archive.db.transaction(() => {
-      const held = archive.db.query<{value:string}, [string]>("SELECT value FROM meta WHERE key=?").get(lock)
-      if (held && Number(held.value) > Date.now()) return false
-
-      archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(lock,String(Date.now()+60_000))
-      return true
-    }).immediate()
-    if (!claimed) throw new MemoryError("Historian session is being created")
-
-    try {
-      const session = await ctx.session.create({title:"OptMem historian (background memory)",model,
-        location:{directory:homedir()},metadata:{optmem:"historian"},
-        permissions:[{action:"*",resource:"*",effect:"deny"}]} as never,{signal})
-      archive.db.query("INSERT INTO meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key,session.id)
-      return session.id
-    } finally {
-      archive.db.query("DELETE FROM meta WHERE key=?").run(lock)
-    }
-  }
-  async function generate(prompt: string, signal: AbortSignal): Promise<string> {
-    for (const model of models) {
-      try {
-        const sessionID = await historianSession(model,signal)
-        return (await ctx.session.generate({sessionID:sessionID as never,prompt},{signal})).text
-      } catch {
-        if (signal.aborted) throw new MemoryError("Historian cancelled")
-      }
-    }
-    throw new MemoryError("No historian model produced a response")
-  }
+  // Stateless generation: no session, no history, nothing in the session list.
+  const generator = new Generator(archive, models, async (model, prompt, signal) =>
+    (await ctx.generate.text({model, prompt}, {signal})).text)
+  const generate = (prompt: string, signal: AbortSignal) => generator.generate(prompt, signal)
   const worker = new Historian(archive,{generate,...embeddings ? {embeddings} : {},log})
   // The CLI reaches this process's own background service with its stored
   // credentials; an explicit --server URL would need a password.
@@ -105,7 +65,7 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
           const source = archive.evidence(id)!
           return {id,kind:source.kind,at:source.at,text:redact(source.text.slice(0,5000))}
         }))
-        const prepared = memories.map(memory => ({...memory,text:redact(memory.text)}))
+        const prepared = memories.map(modelMemory)
         if (!evidence.length && !prepared.length) return {content:"No matching archived evidence found. This does not establish that the event never happened."}
 
         const fallback = () => ({content:JSON.stringify({notice:"Historian unavailable; retrieved evidence follows, not a synthesized answer.",memories:prepared,evidence})})
@@ -122,12 +82,6 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
 
   await ctx.session.hook("context", async event => {
     for (const name of LEGACY_TOOLS) delete event.tools[name]
-    // The historian's own requests must not recall memories into themselves.
-    if (isHistorian(event.sessionID)) {
-      delete event.tools.memory
-      return
-    }
-
     const user = [...event.messages].reverse().find(message => message.role === "user")
     const content = user?.content
     const query = typeof content === "string" ? content : Array.isArray(content) ? content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") : ""
@@ -154,13 +108,13 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
       for await (const event of ctx.event.subscribe({signal:controller.signal})) {
         const data = event.data as Record<string,unknown>
         if (!event.type.startsWith("session.") || !("durable" in event) || typeof data.sessionID !== "string") continue
-        if (event.location?.directory !== ctx.location.directory || isHistorian(data.sessionID)) continue
+        if (event.location?.directory !== ctx.location.directory) continue
 
         archive.capture({id:`event:${event.id}`,project,session:data.sessionID,message:event.id,kind:"event",at:event.created,text:"",payload:JSON.stringify(event)},false)
         if (["session.execution.succeeded","session.execution.failed","session.execution.interrupted","session.inbox.enqueued"].includes(event.type)) {
           // Subagents get read-only recall/context, but no duplicate extraction.
           const session = await ctx.session.get({sessionID:data.sessionID as never},{signal:controller.signal}).catch(() => undefined)
-          if (session && !session.parentID && session.metadata?.optmem !== "historian") { capture.request(data.sessionID,project,ctx.location.directory); maintain() }
+          if (session && !session.parentID) { capture.request(data.sessionID,project,ctx.location.directory); maintain() }
         }
       }
     } catch { if (!controller.signal.aborted) log("memory event stream failed; full export backstop retained") }

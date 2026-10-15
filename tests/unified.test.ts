@@ -8,7 +8,7 @@ import { Historian, contextBlock, validateExtraction } from "../src/historian.ts
 import { redact, worthExtracting } from "../src/redact.ts"
 import { setupUnified } from "../src/unified.ts"
 
-test("unified hooks recognize shared historian sessions and keep capturing ordinary sessions", async () => {
+test("unified hooks remove legacy tools, inject memory and capture ordinary sessions", async () => {
   const root = mkdtempSync(join(tmpdir(), "optmem-unified-"))
   const archivePath = join(root, "archive.sqlite")
   const archive = new Archive(archivePath)
@@ -28,9 +28,8 @@ test("unified hooks recognize shared historian sessions and keep capturing ordin
     event: { async *subscribe() {
       await ready
 
-      for (const sessionID of ["historian", "ordinary"]) {
-        yield { id: sessionID, type: "session.message.created", durable: true, created: 1, location: { directory }, data: { sessionID } }
-      }
+      yield { id: "ordinary", type: "session.message.created", durable: true, created: 1, location: { directory }, data: { sessionID: "ordinary" } }
+      yield { id: "elsewhere", type: "session.message.created", durable: true, created: 1, location: { directory: `${directory}-other` }, data: { sessionID: "elsewhere" } }
 
       finish()
     } },
@@ -38,23 +37,15 @@ test("unified hooks recognize shared historian sessions and keep capturing ordin
 
   try {
     dispose = await setupUnified(ctx as unknown as Parameters<typeof setupUnified>[0], [])
-    // Another plugin instance can register a historian after this one starts.
-    archive.db.query("INSERT INTO meta VALUES(?,?)").run("historian:test/model#", "historian")
-    archive.db.query("INSERT INTO meta VALUES(?,?)").run("lock:historian:test/model#", "ordinary")
     const ordinary: ContextEvent = { sessionID: "ordinary", tools: { memory: {}, memo_wake: {}, read: {} }, system: [], messages: [] }
     await hook(ordinary)
     expect(Object.keys(ordinary.tools)).toEqual(["memory", "read"])
     expect(ordinary.system).toHaveLength(1)
 
-    const historian: ContextEvent = { sessionID: "historian", tools: { memory: {}, memo_note: {}, read: {} }, system: [], messages: [] }
-    await hook(historian)
-    expect(Object.keys(historian.tools)).toEqual(["read"])
-    expect(historian.system).toHaveLength(0)
-
     start()
     await drained
-    expect(archive.evidence("event:historian")).toBeNull()
     expect(archive.evidence("event:ordinary")?.session).toBe("ordinary")
+    expect(archive.evidence("event:elsewhere")).toBeNull()
   } finally {
     start()
     dispose?.()
