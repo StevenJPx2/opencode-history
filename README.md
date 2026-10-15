@@ -43,7 +43,8 @@ Options, through the object form of the plugin entry:
 - `memoryDir`: the store, default `$MEMORY_DIR` or `~/.optmem/memory`
 - `compression`: set `false` to disable background compression, enabled by default
 - `model`: primary model (`provider/id#variant`), default `openai/gpt-6-luna#xhigh`
-- `fallbackModel`: fallback model, default `opencode/mimo-v2.6-flash-free`; set `false` to disable
+- `fallbackModels`: fallback chain, tried in order; each entry may be `provider/id#variant` or a `{providerID, id}` reference. `fallbackModel` accepts one model the same way, and both may be set at once
+- `fallbackModel: false`: no fallbacks at all; otherwise an unset option means the default `opencode/mimo-v2.6-flash-free`
 - `backstopSeconds`: check for pending blocks from other sessions, default `300`
 - `blocksPerPass`: maximum blocks in one pass, default `8`; full passes continue
 - `attemptsPerBlock`: retry count for an overlong model response, default `3`
@@ -59,10 +60,10 @@ global store to these models for compression.
 Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with automatic memory:
 
 - Full session exports are archived in `~/.local/share/optmem/archive.sqlite` (option `archivePath`).
-- Each completed assistant reply, with its turn's user message, goes to the historian model (`model`, then `fallbackModel`). It extracts source-cited memories in the background, or none.
+- Each completed assistant reply, with its turn's user message, goes to the historian model. The `model` answers first, then each entry of the fallback chain in order; duplicates are dropped and any model OpenCode cannot run is skipped and logged. It extracts source-cited memories in the background, or none.
 - Outgoing evidence keeps user/assistant text and each tool's name/status, but drops tool arguments, results, and error details. This also applies to already-queued passages and on-demand recall; complete originals and source IDs are preserved in the archive.
 - Historian calls are stateless: they create no OpenCode sessions and add nothing to any session's history.
-- A model that fails cools down (shared by every open project), honouring a provider's retry-after. A job whose model output stays unusable is marked `failed` after five attempts; outages and reloads do not use up attempts.
+- A model that fails cools down (shared by every open project), honouring a provider's retry-after, so a model in the chain that is down is skipped for the rest of its cooldown and the next one answers. A job whose model output stays unusable is marked `failed` after five attempts; outages and reloads do not use up attempts.
 - Secrets are masked locally before any archived text or stored memory reaches a model.
 - Each model request gets a bounded block of project and global memories. The `memory` tool asks the historian when that is not enough.
 

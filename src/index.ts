@@ -21,7 +21,7 @@ import { join } from "node:path"
 import { Registry } from "./registry.ts"
 import { renderWake } from "./render.ts"
 import { GLOBAL, Store, readSizes } from "./store.ts"
-import { Compressor, runnable, type Model } from "./worker.ts"
+import { Compressor, runnable, type Listed, type Model } from "./worker.ts"
 import { matches, scopedView, type Relevant } from "./wake.ts"
 import { setupUnified } from "./unified.ts"
 
@@ -62,6 +62,31 @@ export function modelRef(option: unknown, fallback = DEFAULT_MODEL): Model {
 
 function modelName(model: Model): string {
   return `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
+}
+
+/**
+ * The historian's chain: the primary first, then every configured fallback in
+ * order, deduplicated. `fallbackModel` accepts a string or a list, and
+ * `fallbackModels` always takes a list; `false` means no fallbacks at all.
+ */
+export function modelChain(options: Record<string, unknown>, defaults: { fallback?: string } = {}): Model[] {
+  const configured: unknown[] = []
+  // An explicit false means no fallbacks at all; only silence falls back to the default.
+  const disabled = options.fallbackModel === false || options.fallbackModels === false
+  for (const [key, value] of [["fallbackModel", options.fallbackModel], ["fallbackModels", options.fallbackModels]] as const) {
+    if (value === false || value === undefined || value === null) continue
+    for (const entry of Array.isArray(value) ? value : [value]) {
+      if (typeof entry === "string" && entry.trim()) configured.push(entry.trim())
+      else if (entry && typeof entry === "object") configured.push(entry)
+    }
+  }
+  const fallback = disabled ? undefined : (configured.length > 0 ? undefined : defaults.fallback)
+  const chain = [
+    modelRef(options.model),
+    ...configured.map(entry => modelRef(entry, "")),
+    ...(fallback === undefined ? [] : [modelRef(fallback)]),
+  ]
+  return chain.filter((model, index, all) => all.findIndex((other) => modelName(other) === modelName(model)) === index)
 }
 
 function positive(option: unknown, fallback: number): number {
@@ -140,12 +165,32 @@ prints is one node of it. memo_zoom opens a node into its two halves,
 down to the raw memories.`
 }
 
+/** Skip configured models OpenCode cannot resolve, keeping the configured order. */
+async function available(ctx: { model: { list(): Promise<{ data: readonly Listed[] }> } }, configured: readonly Model[], log: (message: string) => void): Promise<Model[]> {
+  try {
+    const listed = (await ctx.model.list()).data
+    const usable = configured.filter((model) => runnable(listed, model))
+
+    for (const model of configured) {
+      if (!usable.some((entry) => modelName(entry) === modelName(model))) {
+        log(`skipping unavailable compression model ${modelName(model)}`)
+      }
+    }
+
+    return usable
+  } catch (error) {
+    log(`cannot list models (${error}); will try configured models in order`)
+    return [...configured]
+  }
+}
+
 export default Plugin.define({
   id: "optmem",
   async setup(ctx) {
     if (ctx.options.mode === "unified") {
-      const models = [modelRef(ctx.options.model), ...(ctx.options.fallbackModel === false ? [] : [modelRef(ctx.options.fallbackModel,DEFAULT_FALLBACK_MODEL)])]
-      return setupUnified(ctx,models)
+      // The primary always gets first refusal, and a vanished model costs no call.
+      const models = await available(ctx, modelChain(ctx.options, { fallback: DEFAULT_FALLBACK_MODEL }), message => console.log(`[optmem] ${message}`))
+      return setupUnified(ctx, models)
     }
     const memo = expand(typeof ctx.options.memo === "string" ? ctx.options.memo : "~/.optmem/memo")
     const memoryDir = expand(
@@ -161,35 +206,8 @@ export default Plugin.define({
     const scopes = [GLOBAL, watch]
     const compressing = existsSync(memo) && ctx.options.compression !== false
     const log = (message: string) => console.log(`[optmem] ${message}`)
-    const primary = modelRef(ctx.options.model)
-    const fallback = ctx.options.fallbackModel === false
-      ? undefined
-      : modelRef(ctx.options.fallbackModel, DEFAULT_FALLBACK_MODEL)
-    const configured = [primary, ...(fallback === undefined ? [] : [fallback])].filter(
-      (model, index, all) => all.findIndex((other) => modelName(other) === modelName(model)) === index,
-    )
-
-    // Skip configured models which OpenCode cannot resolve, retaining the
-    // configured order so the primary always gets first refusal.
-    async function available(): Promise<Model[]> {
-      try {
-        const listed = (await ctx.model.list()).data
-        const usable = configured.filter((model) => runnable(listed, model))
-
-        for (const model of configured) {
-          if (!usable.some((entry) => modelName(entry) === modelName(model))) {
-            log(`skipping unavailable compression model ${modelName(model)}`)
-          }
-        }
-
-        return usable
-      } catch (error) {
-        log(`cannot list models (${error}); will try configured models in order`)
-        return configured
-      }
-    }
-
-    const models = compressing ? await available() : []
+    const configured = modelChain(ctx.options, { fallback: DEFAULT_FALLBACK_MODEL })
+    const models = compressing ? await available(ctx, configured, log) : []
 
     if (compressing && models.length === 0) {
       log("background compression off: none of the configured models are available")

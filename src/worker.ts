@@ -11,7 +11,7 @@ export interface Model {
 }
 
 /** The shape `ctx.model.list()` reports for one model. */
-interface Listed {
+export interface Listed {
   readonly providerID: string
   readonly modelID: string
   readonly variants?: readonly { readonly id: string }[]
