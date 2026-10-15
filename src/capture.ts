@@ -1,26 +1,11 @@
 import { execFile } from "node:child_process"
 import { Archive, digest, type Evidence } from "./archive.ts"
+import { recordAudit } from "./audit.ts"
+import { transcriptText } from "./passages.ts"
 
 export interface Transcript { info: {id: string; parentID?: string}; messages: Array<Record<string, unknown>> }
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {}
-}
-
-function readable(message: Record<string, unknown>): string {
-  const text = typeof message.text === "string" ? message.text : ""
-  const content = Array.isArray(message.content) ? message.content : []
-  return [text,...content.flatMap(value => {
-    const part = record(value)
-    if (part.type === "text" && typeof part.text === "string") return [part.text]
-    if (part.type !== "tool") return []
-
-    const state = record(part.state)
-    return [JSON.stringify({tool:part.name,status:state.status,input:state.input,error:state.error}),
-      ...(Array.isArray(state.content) ? state.content.flatMap(value => {
-        const output = record(value)
-        return typeof output.text === "string" ? [output.text] : []
-      }) : [])]
-  })].filter(Boolean).join("\n")
 }
 
 /** Preserve complete exports, then source-linked, bounded passages for processing. */
@@ -46,7 +31,7 @@ export function importTranscript(archive: Archive, project: string, raw: string,
       const time = record(message.time)
       const at = typeof time.created === "number" && Number.isFinite(time.created) ? time.created : 0
       const id = `message:${session}:${message.id}:${digest(payload)}`
-      const text = readable(message)
+      const text = transcriptText(message)
       archive.capture({id,project,session,message:message.id,kind:"original",at,text:"",payload},false)
       // Never extract an in-flight assistant response. Durable event capture
       // retains intermediate states; a later completed export supplies passages.
@@ -114,9 +99,11 @@ export class CaptureQueue {
           const owned = this.archive.db.query("SELECT 1 FROM captures WHERE session=? AND token=? AND lease>?").get(job.session,job.token,Date.now())
           if (!owned) return
 
-          importTranscript(this.archive,job.project,raw,job.session)
+          const passages = importTranscript(this.archive,job.project,raw,job.session)
           this.archive.db.query("DELETE FROM captures WHERE session=? AND token=? AND requested=?").run(job.session,job.token,job.requested)
           this.archive.db.query("UPDATE captures SET token=NULL,lease=0 WHERE session=? AND token=?").run(job.session,job.token)
+          // Silence here is the signal that conversations stopped being saved.
+          recordAudit(this.archive, {at: Date.now(), op:"capture", outcome:"done", subject:job.session, count:passages})
         }).immediate()
       } catch {
         // After shutdown the archive may be closed; the expired lease retries it.
@@ -125,6 +112,7 @@ export class CaptureQueue {
         this.archive.db.query("UPDATE captures SET token=NULL,lease=0,ready=?,error=? WHERE session=? AND token=?")
           .run(Date.now()+60_000,"Full export failed; queued for retry",job.session,job.token)
         this.log("conversation export failed; queued for retry")
+        recordAudit(this.archive, {at: Date.now(), op:"capture", outcome:"deferred", subject:job.session, reason:"Full export failed; queued for retry", count:0})
       }
     }
   }

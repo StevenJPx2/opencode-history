@@ -17,6 +17,7 @@ export type ContextEvent = {
 
 export interface Host {
   root: string
+  directory: string
   archivePath: string
   /** Every prompt the plugin sent to a model, in order. */
   prompts: string[]
@@ -64,7 +65,7 @@ export async function startHost(options: {
   // SAFETY: the fake implements exactly the context members the plugin uses.
   const dispose = await setupUnified(ctx as unknown as Parameters<typeof setupUnified>[0], options.models ?? [{ providerID: "test", id: "model" }])
   return {
-    root, archivePath, prompts, created, tools,
+    root, directory, archivePath, prompts, created, tools,
     async context(sessionID, user) {
       const event: ContextEvent = { sessionID, tools: { memory: {}, memo_wake: {}, memo_note: {}, read: {} }, system: [], messages: [{ role: "user", content: user }] }
       await hook(event)

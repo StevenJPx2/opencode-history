@@ -1,19 +1,23 @@
 import type { Plugin } from "@opencode/plugin"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { Archive, digest, type Remembered, type Scope } from "./archive.ts"
+import { memoryStatus, recordAudit } from "./audit.ts"
 import { CaptureQueue, exportTranscript } from "./capture.ts"
 import { Generator } from "./generator.ts"
 import { Historian, contextBlock, fuse, modelMemory, retrieve } from "./historian.ts"
 import { migrateOptMem } from "./migrate.ts"
-import { redact } from "./redact.ts"
+import { modelEvidence } from "./passages.ts"
 import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
 
 type Context = Plugin.Context
 const option = (ctx: Context, key: string, fallback: string) => typeof ctx.options[key] === "string" ? ctx.options[key] as string : fallback
 const expand = (path: string) => path.startsWith("~/") ? join(homedir(),path.slice(2)) : path
 const LEGACY_TOOLS = ["memo_wake","memo_note","memo_nap","memo_recall","memo_zoom","memo_scope","memo_forget"]
+
+/** A pinned release lives in .../releases/<hash>; a working copy runs from the repo. */
+const RELEASE = /^[0-9a-f]{16}$/.test(basename(dirname(import.meta.dir))) ? basename(dirname(import.meta.dir)) : "working copy"
 
 /** Opt-in until a verified migration and the local service are deployed. */
 export async function setupUnified(ctx: Context, models: Array<{providerID:string;id:string;variant?:string}>) {
@@ -33,7 +37,7 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   const generator = new Generator(archive, models, async (model, prompt, signal) =>
     (await ctx.generate.text({model, prompt}, {signal})).text)
   const generate = (prompt: string, signal: AbortSignal) => generator.generate(prompt, signal)
-  const worker = new Historian(archive,{generate,...embeddings ? {embeddings} : {},log})
+  const worker = new Historian(archive,{generate,...embeddings ? {embeddings} : {},log,location:ctx.location.directory,release:RELEASE})
   // The CLI reaches this process's own background service with its stored
   // credentials; an explicit --server URL would need a password.
   const capture = new CaptureQueue(archive,exportTranscript,option(ctx,"opencode","opencode"),log)
@@ -50,6 +54,12 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   timer.unref?.()
 
   await ctx.tool.transform(editor => {
+    editor.add({name:"memory_status",description:"Report OptMem's own health: whether conversations are being saved, whether the background worker is alive, queued/running/failed work, and any model cooldown. Use it when memory seems stale, instead of guessing.",input:{type:"object",properties:{detail:{type:"boolean",description:"true includes the last 20 pipeline events; false is just the summary"}},additionalProperties:false},options:{codemode:false},
+      async execute(input) {
+        const detail = (input as {detail?:boolean}).detail !== false
+        const report = {...memoryStatus(archive),recent:detail ? archive.audit({limit:20}) : []}
+        return {content:JSON.stringify(report)}
+      }})
     editor.add({name:"memory",description:"Ask the memory historian when automatically retrieved context is insufficient. Searches this project plus global by default. Use scope all only for an explicit cross-project lookup. Answers cite archived evidence; this tool does not write memories.",
       input:{type:"object",properties:{question:{type:"string",minLength:1,maxLength:8000},scope:{type:"string",enum:["project","all"]}},required:["question"],additionalProperties:false},options:{codemode:false},
       async execute(input, context) {
@@ -63,7 +73,8 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
         const sources = [...new Set([...memories.flatMap(memory => memory.sources),...hits.map(hit=>hit.id)])].slice(0,16)
         const evidence = await Promise.all(sources.map(async id => {
           const source = archive.evidence(id)!
-          return {id,kind:source.kind,at:source.at,text:redact(source.text.slice(0,5000))}
+          const supplied = modelEvidence(archive,source)
+          return {...supplied,text:supplied.text.slice(0,5000)}
         }))
         const prepared = memories.map(modelMemory)
         if (!evidence.length && !prepared.length) return {content:"No matching archived evidence found. This does not establish that the event never happened."}
@@ -76,7 +87,10 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
               answer.citations.some(id => typeof id !== "string" || !sources.includes(id))) return fallback()
 
           return {content:JSON.stringify({answer:answer.answer,citations:answer.citations,evidence})}
-        } catch { return fallback() }
+        } catch {
+          recordAudit(archive,{at:Date.now(),op:"recall",outcome:"deferred",subject:project,reason:"Historian unavailable; evidence returned",count:evidence.length})
+          return fallback()
+        }
       }})
   })
 

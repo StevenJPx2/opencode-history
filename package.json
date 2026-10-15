@@ -10,6 +10,8 @@
   },
   "scripts": {
     "stage-release": "bun tools/stage-release.ts",
+    "status": "bun tools/status.ts",
+    "audit": "bun tools/status.ts audit",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests",
     "check": "bun run typecheck && bun run test"

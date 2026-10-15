@@ -1,5 +1,6 @@
 // Canonical evidence and rebuildable memory projections. No model owns the
 // archive: completed messages are captured whether or not a judge selects them.
+import { auditFeed, memoryStatus, workerHeartbeat, type AuditEntry, type AuditQuery, type Status } from "./audit.ts"
 import { Database } from "bun:sqlite"
 import { createHash, randomUUID } from "node:crypto"
 import { mkdirSync, chmodSync } from "node:fs"
@@ -88,6 +89,12 @@ export class Archive {
       CREATE INDEX IF NOT EXISTS evidence_project ON evidence(project,at);
       CREATE VIRTUAL TABLE IF NOT EXISTS evidence_search USING fts5(id UNINDEXED,text);
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED,text);
+      CREATE TABLE IF NOT EXISTS audit(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, op TEXT NOT NULL,
+        outcome TEXT NOT NULL, subject TEXT NOT NULL, phase TEXT, model TEXT,
+        reason TEXT, count INTEGER NOT NULL DEFAULT 0, duration INTEGER) STRICT;
+      CREATE INDEX IF NOT EXISTS audit_at ON audit(at);
+      CREATE INDEX IF NOT EXISTS audit_op ON audit(op,outcome);
       INSERT OR IGNORE INTO meta VALUES('schema','1');
     `)
     const version = this.db.query<{value: string}, []>("SELECT value FROM meta WHERE key='schema'").get()?.value
@@ -271,6 +278,15 @@ export class Archive {
       return {id: row.memory, score: query.reduce((sum, value, i) => sum + value * values[i]!, 0)}
     }).sort((a,b) => b.score-a.score || a.id.localeCompare(b.id)).slice(0, bounded(limit)).map(row => this.memory(row.id)!)
   }
+
+  /** Each plugin instance contributes its location and release; stale ones fall away. */
+  workerHeartbeat(location: string, options: { release?: string | undefined; at?: number } = {}): void { workerHeartbeat(this, location, options) }
+
+  /** Read-only view of pipeline history, for `status` and the `memory_status` tool. */
+  audit(query: AuditQuery = {}): AuditEntry[] { return auditFeed(this, query) }
+
+  /** Read-only health summary: is the worker alive, what is queued, what failed. */
+  status(options: { at?: number; staleMs?: number } = {}): Status { return memoryStatus(this, options) }
 
   close(): void { this.db.close() }
 }

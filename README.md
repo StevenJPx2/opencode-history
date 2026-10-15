@@ -60,6 +60,7 @@ Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with
 
 - Full session exports are archived in `~/.local/share/optmem/archive.sqlite` (option `archivePath`).
 - Each completed assistant reply, with its turn's user message, goes to the historian model (`model`, then `fallbackModel`). It extracts source-cited memories in the background, or none.
+- Outgoing evidence keeps user/assistant text and each tool's name/status, but drops tool arguments, results, and error details. This also applies to already-queued passages and on-demand recall; complete originals and source IDs are preserved in the archive.
 - Historian calls are stateless: they create no OpenCode sessions and add nothing to any session's history.
 - A model that fails cools down (shared by every open project), honouring a provider's retry-after. A job whose model output stays unusable is marked `failed` after five attempts; outages and reloads do not use up attempts.
 - Secrets are masked locally before any archived text or stored memory reaches a model.
@@ -72,6 +73,25 @@ Semantic search is optional. To use it, run the local EmbeddingGemma 2 service a
 ```sh
 uv run --script tools/embedding-server.py   # http://127.0.0.1:18791
 ```
+
+## Checking it is working
+
+Unified mode records what the background pipeline did, so you do not have to
+query the archive by hand:
+
+```sh
+bun run status                    # worker, captures, queue, failures, cooldowns
+bun run audit                     # the recent operation feed
+bun run audit --follow extract    # stream one kind of event
+```
+
+- `status` reports whether a worker is beating (and which deployed release it is), how many conversations are queued to export, queued/running/done/failed jobs, grouped failure reasons, and model cooldowns.
+- Each operation records an id, an outcome, a count, a duration and a fixed reason. Prompts, passages and tool output are never recorded.
+- The agent can ask the same questions from inside a session with the `memory_status` tool.
+- The feed keeps the last 5000 records and is followable with an exclusive id cursor, so nothing repeats.
+
+Both commands are read-only. They read `OPTMEM_ARCHIVE` when set, otherwise the
+live `archivePath`.
 
 ## Develop
 
