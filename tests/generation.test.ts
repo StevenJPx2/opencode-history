@@ -19,15 +19,20 @@ async function until(check: () => boolean, ms = 3000): Promise<boolean> {
   return check()
 }
 
-test("background extraction reaches the model without creating an OpenCode session", async () => {
+test("background extraction reaches the model through an archived, empty session", async () => {
   const root = mkdtempSync(join(tmpdir(), "optmem-gen-"))
   const seed = new Archive(join(root, "archive.sqlite"))
   importTranscript(seed, seed.project(join(root, "alpha")), turn, "ses_gen")
   seed.close()
-  const host = await startHost({ root })
+  const host = await startHost({ root, models: [{ providerID: "test", id: "model" }], script: { test: [JSON.stringify({ memories: [] })] } })
   try {
     expect(await until(() => host.prompts.length > 0)).toBe(true)
-    expect(host.created).toEqual([])
+    // The only session the plugin makes is its own transport: archived on
+    // creation, asked through, and never messaged.
+    expect(host.created).toHaveLength(1)
+    expect(host.sessions.archived).toEqual(["ses_historian_1"])
+    expect(host.sessions.prompted).toEqual([])
+    expect(host.sessions.generated.map(entry => entry.sessionID)).toEqual(["ses_historian_1"])
   } finally { host.dispose(); await Bun.sleep(20); removeRoot(root) }
 })
 

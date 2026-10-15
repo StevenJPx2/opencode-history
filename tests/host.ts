@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setupUnified } from "../src/unified.ts"
 
-type Generate = (prompt: string, signal: AbortSignal) => Promise<string>
+type Generate = (prompt: string, signal: AbortSignal, model: string) => Promise<string>
 type Tool = { name: string; execute: (input: unknown, context: { sessionID: string; signal: AbortSignal }) => Promise<{ content: string }> }
 export type ContextEvent = {
   sessionID: string
@@ -15,14 +15,27 @@ export type ContextEvent = {
   messages: Array<{ role: string; content: string }>
 }
 
+export interface SessionRecord {
+  created: Array<{ id: string; title?: string; model?: { providerID: string; id: string; variant?: string } }>
+  archived: string[]
+  removed: string[]
+  generated: Array<{ sessionID: string; prompt: string }>
+  prompted: Array<{ sessionID: string; prompt: string }>
+  /** Why a scripted answer was not available, for diagnosing a failing test. */
+  errors: string[]
+}
+
 export interface Host {
   root: string
   directory: string
   archivePath: string
   /** Every prompt the plugin sent to a model, in order. */
   prompts: string[]
+  /** Prompts sent to the stateless generate route, which memory should never use. */
+  stateless: number
   /** Sessions the plugin asked OpenCode to create. */
   created: unknown[]
+  sessions: SessionRecord
   tools: Map<string, Tool>
   context(sessionID: string, user: string): Promise<ContextEvent>
   dispose(): void
@@ -32,32 +45,64 @@ export async function startHost(options: {
   root?: string
   directory?: string
   generate?: Generate
-  models?: Array<{ providerID: string; id: string }>
+  models?: Array<{ providerID: string; id: string; variant?: string }>
+  /** Answers per model; anything not scripted fails as an outage. */
+  script?: Record<string, Array<string | Error>>
 }): Promise<Host> {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "optmem-host-"))
   const archivePath = join(root, "archive.sqlite")
   const directory = options.directory ?? join(root, "alpha")
   const prompts: string[] = []
   const created: unknown[] = []
+  const sessions: SessionRecord = { created: [], archived: [], removed: [], generated: [], prompted: [], errors: [] }
   const tools = new Map<string, Tool>()
+  let stateless = 0
   let hook!: (event: ContextEvent) => Promise<void>
-  const generate = options.generate ?? (async () => JSON.stringify({ memories: [] }))
+  let counter = 0
+  const script = options.script ? { ...options.script } : {}
+  const generate = options.generate ?? (async (prompt, signal, model) => {
+    const reply = script[model]?.shift()
+    if (reply === undefined) {
+      sessions.errors.push(`no scripted reply for ${model} (have ${Object.keys(script).join(",")})`)
+      throw Object.assign(new Error(`no scripted reply for ${model}`), { _tag: "ServiceUnavailableError" })
+    }
+    if (reply instanceof Error) throw reply
+    return reply
+  })
 
   const ctx = {
     options: { archivePath, memoryDir: join(root, "no-legacy-store") },
     location: { directory, project: { canonical: directory } },
     tool: { transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => callback({ add: tool => tools.set(tool.name, tool) }) },
     generate: {
-      text: async ({ prompt }: { prompt: string }, request?: { signal?: AbortSignal }) => {
+      text: async ({ model, prompt }: { model: { providerID: string; id: string; variant?: string }; prompt: string }, request?: { signal?: AbortSignal }) => {
+        stateless++
         prompts.push(prompt)
-        return { text: await generate(prompt, request?.signal ?? new AbortController().signal) }
+        return { text: await generate(prompt, request?.signal ?? new AbortController().signal, `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`) }
       },
     },
     session: {
       hook: async (name: string, callback: typeof hook) => { if (name === "context") hook = callback },
-      create: async (input: unknown) => { created.push(input); return { id: `ses_created_${created.length}` } },
+      create: async (input: { title?: string; model?: { providerID: string; id: string; variant?: string } }) => {
+        counter++
+        const id = `ses_historian_${counter}`
+        created.push(input)
+        sessions.created.push({ id, ...input })
+        return { id }
+      },
+      update: async ({ sessionID, time }: { sessionID: string; time?: { archived?: number } }) => {
+        if (time?.archived) sessions.archived.push(sessionID)
+      },
+      remove: async ({ sessionID }: { sessionID: string }) => { sessions.removed.push(sessionID) },
+      prompt: async ({ sessionID, text }: { sessionID: string; text: string }) => { sessions.prompted.push({ sessionID, prompt: text }); return {} },
       get: async () => ({}),
-      generate: async ({ prompt }: { prompt: string }) => { prompts.push(prompt); return { text: await generate(prompt, new AbortController().signal) } },
+      generate: async ({ sessionID, prompt }: { sessionID: string; prompt: string }, request?: { signal?: AbortSignal }) => {
+        sessions.generated.push({ sessionID, prompt })
+        prompts.push(prompt)
+        const session = sessions.created.find(entry => entry.id === sessionID)
+        const model = session?.model
+        return { text: await generate(prompt, request?.signal ?? new AbortController().signal, model ? `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}` : "unknown") }
+      },
     },
     event: { subscribe: ({ signal }: { signal: AbortSignal }) => idle(signal) },
   }
@@ -65,7 +110,8 @@ export async function startHost(options: {
   // SAFETY: the fake implements exactly the context members the plugin uses.
   const dispose = await setupUnified(ctx as unknown as Parameters<typeof setupUnified>[0], options.models ?? [{ providerID: "test", id: "model" }])
   return {
-    root, directory, archivePath, prompts, created, tools,
+    root, directory, archivePath, prompts, created, sessions, tools,
+    get stateless() { return stateless },
     async context(sessionID, user) {
       const event: ContextEvent = { sessionID, tools: { memory: {}, memo_wake: {}, memo_note: {}, read: {} }, system: [], messages: [{ role: "user", content: user }] }
       await hook(event)

@@ -62,7 +62,7 @@ Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with
 - Full session exports are archived in `~/.local/share/optmem/archive.sqlite` (option `archivePath`).
 - Each completed assistant reply, with its turn's user message, goes to the historian model. The `model` answers first, then each entry of the fallback chain in order; duplicates are dropped and any model OpenCode cannot run is skipped and logged. It extracts source-cited memories in the background, or none.
 - Outgoing evidence keeps user/assistant text and each tool's name/status, but drops tool arguments, results, and error details. This also applies to already-queued passages and on-demand recall; complete originals and source IDs are preserved in the archive.
-- Historian calls are stateless: they create no OpenCode sessions and add nothing to any session's history.
+- Historian calls add nothing to any session's history. OpenCode's free tier refuses the sessionless generate route, so each model in the chain is asked through one session of its own: created once, archived on arrival, reused by every project, and deleted when the model leaves the chain. It never receives a message and never appears in the session list.
 - A model that fails cools down (shared by every open project), honouring a provider's retry-after, so a model in the chain that is down is skipped for the rest of its cooldown and the next one answers. A job whose model output stays unusable is marked `failed` after five attempts; outages and reloads do not use up attempts.
 - Secrets are masked locally before any archived text or stored memory reaches a model.
 - Each model request gets a bounded block of project and global memories. The `memory` tool asks the historian when that is not enough.

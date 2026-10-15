@@ -22,19 +22,32 @@ const turn = JSON.stringify({ info: { id: "ses_chain" }, messages: [
 /** The plugin's own context, with a model list and a generate double that records. */
 function context(root: string, options: Record<string, unknown>, ask: (model: string) => Promise<string>) {
   const asked: string[] = []
+  const sessions: Array<{ id: string; model?: { providerID: string; id: string; variant?: string } }> = []
+  const name = (model: { providerID: string; id: string; variant?: string }) =>
+    `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
   const ctx = {
     options: { mode: "unified", archivePath: join(root, "archive.sqlite"), memoryDir: join(root, "no-store"), ...options },
     location: { directory: join(root, "alpha"), project: { canonical: join(root, "alpha") } },
     model: { list: async () => ({ data: LISTED }) },
-    generate: {
-      text: async ({ model, prompt }: { model: { providerID: string; id: string; variant?: string }; prompt: string }) => {
-        const name = `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`
-        asked.push(name)
-        return { text: await ask(name) }
-      },
-    },
     tool: { transform: async (callback: (editor: { add: (tool: unknown) => void }) => void) => callback({ add: () => undefined }) },
-    session: { hook: async () => undefined, get: async () => ({}), create: async () => ({ id: "ses_created" }) },
+    session: {
+      create: async (input: { title: string; model: { providerID: string; id: string; variant?: string } }) => {
+        const id = `ses_${sessions.length + 1}`
+        sessions.push({ id, model: input.model })
+        return { id }
+      },
+      update: async () => undefined,
+      remove: async () => undefined,
+      generate: async ({ sessionID }: { sessionID: string }) => {
+        const session = sessions.find(entry => entry.id === sessionID)!
+        const model = name(session.model!)
+        asked.push(model)
+        return { text: await ask(model) }
+      },
+      hook: async () => undefined,
+      get: async () => ({}),
+      prompt: async () => ({}),
+    },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) { await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })) } },
   }
   return { asked, ctx: ctx as unknown as Parameters<typeof plugin.setup>[0] }

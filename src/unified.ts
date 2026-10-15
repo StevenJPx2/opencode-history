@@ -10,6 +10,7 @@ import { Historian, contextBlock, fuse, modelMemory, retrieve } from "./historia
 import { migrateOptMem } from "./migrate.ts"
 import { modelEvidence } from "./passages.ts"
 import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
+import { SessionPool, type SessionApi } from "./sessions.ts"
 
 type Context = Plugin.Context
 const option = (ctx: Context, key: string, fallback: string) => typeof ctx.options[key] === "string" ? ctx.options[key] as string : fallback
@@ -33,9 +34,12 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
   } catch (error) { archive.close(); throw error }
   const project = archive.project(ctx.location.project.canonical)
   const embeddings = typeof ctx.options.embeddingURL === "string" ? embeddingService(ctx.options.embeddingURL,option(ctx,"embeddingModel",EMBEDDING_MODEL)) : undefined
-  // Stateless generation: no session, no history, nothing in the session list.
+  // OpenCode's free tier refuses the sessionless generate route, so the historian
+  // asks through one archived session per model: same text out, still nothing
+  // recorded, and the session never appears in the session list.
+  const sessions = new SessionPool({archive, session: ctx.session as unknown as SessionApi, models, log})
   const generator = new Generator(archive, models, async (model, prompt, signal) =>
-    (await ctx.generate.text({model, prompt}, {signal})).text)
+    sessions.ask(model, prompt, `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}`, signal))
   const generate = (prompt: string, signal: AbortSignal) => generator.generate(prompt, signal)
   const worker = new Historian(archive,{generate,...embeddings ? {embeddings} : {},log,location:ctx.location.directory,release:RELEASE})
   // The CLI reaches this process's own background service with its stored
