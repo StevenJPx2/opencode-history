@@ -139,6 +139,31 @@ test("a short follow-up borrows the previous user message for context", () => {
     .toBe("Which release is deployed and how are historian sessions hidden?")
 })
 
+// Shape observed in production: OpenCode expands attached skills into text
+// parts before the typed prompt, with no metadata, only the wrapper tag.
+const skill = (name: string, words: string) => `<skill_content name="${name}">\n# Skill: ${name}\n${words}\n</skill_content>`
+const attached = (prompt: string) => [
+  { type: "text", text: skill("OpenCode", "configuration plugins keybinds themes providers MCP servers ".repeat(300)) },
+  { type: "text", text: skill("readable-writing", "sentences paragraphs audience clarity jargon ".repeat(200)) },
+  { type: "text", text: prompt },
+]
+
+test("attached skill content does not drown out what the user typed", () => {
+  expect(contextQuery([{ role: "user", content: attached("Which release is deployed?") }])).toBe("Which release is deployed?")
+  // Other wrapped attachments are skipped the same way.
+  expect(contextQuery([{ role: "user", content: [{ type: "text", text: "<system-reminder>\nkeep going\n</system-reminder>" }, { type: "text", text: "Is the historian healthy?" }] }]))
+    .toBe("Is the historian healthy?")
+  // A message that is only attachments still yields something to search.
+  expect(contextQuery([{ role: "user", content: [{ type: "text", text: skill("OpenCode", "plugins") }] }])).toContain("plugins")
+})
+
+test("a short follow-up with attachments borrows the previous typed question, not the skill text", () => {
+  expect(contextQuery([
+    { role: "user", content: attached("Which release is deployed?") },
+    { role: "user", content: attached("Is it working?") },
+  ])).toBe("Which release is deployed?\nIs it working?")
+})
+
 test("through the plugin hook: irrelevant turns get no memory block; relevant ones do", async () => {
   const host = await startHost({})
   const archive = new Archive(host.archivePath)
@@ -152,5 +177,7 @@ test("through the plugin hook: irrelevant turns get no memory block; relevant on
     const relevant = (await host.context("ses_work", "Which release is deployed and are historian sessions hidden?")).system.map(part => part.text).join("\n")
     expect(relevant).toContain("Release 138c was deployed")
     expect(relevant).not.toContain("Routine note")
+    const withSkills = (await host.context("ses_child", attached("Which release is deployed and are historian sessions hidden?"))).system.map(part => part.text).join("\n")
+    expect(withSkills).toContain("Release 138c was deployed")
   } finally { host.dispose(); await Bun.sleep(20); archive.close(); removeRoot(host.root) }
 })

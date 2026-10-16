@@ -67,6 +67,7 @@ Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with
 - Secrets are masked locally before any archived text or stored memory reaches a model.
 - Each model request gets a bounded block of relevant project and global memories, or none when nothing is relevant. The `memory` tool asks the historian when that is not enough.
   - Relevance: a keyword match needs several specific terms (words found in over 10% of memories do not count), or one identifier such as a hash or model name. With embeddings, a semantic match must reach `semanticFloor` (default `0.8`, calibrated for EmbeddingGemma 2). Recency can reorder matches but never admits one alone.
+  - The search uses what the user typed. Attached skills and other wrapped attachments (such as `<skill_content>` parts) are skipped, unless the message has nothing else.
   - A terse follow-up, such as "Is it working?", is searched together with the previous user message.
   - Paraphrased duplicates are shown once, as the most specific wording. Entries with different numbers or statuses are never merged.
   - Entries are dated and shown oldest first. An unresolved or proposed entry with a related, later confirmed one is flagged as possibly resolved, never hidden. Explicit corrections still hide what they supersede.

@@ -12,7 +12,7 @@ export type ContextEvent = {
   sessionID: string
   tools: Record<string, unknown>
   system: Array<{ type: string; text: string }>
-  messages: Array<{ role: string; content: string }>
+  messages: Array<{ role: string; content: string | Array<{ type: string; text: string }> }>
 }
 
 export interface SessionRecord {
@@ -37,7 +37,7 @@ export interface Host {
   created: unknown[]
   sessions: SessionRecord
   tools: Map<string, Tool>
-  context(sessionID: string, user: string): Promise<ContextEvent>
+  context(sessionID: string, user: string | Array<{ type: string; text: string }>): Promise<ContextEvent>
   dispose(): void
 }
 

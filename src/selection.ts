@@ -76,11 +76,21 @@ export function contextQuery(messages: ReadonlyArray<{ role: string; content: un
   return previous !== undefined && terms(latest).length < 3 ? `${previous.slice(0, 1000)}\n${latest}` : latest
 }
 
+/**
+ * OpenCode expands attached skills into text parts wrapped as
+ * `<skill_content name="…">…</skill_content>`, with no metadata. Other
+ * attachments and reminders use the same whole-part wrapping.
+ */
+const WRAPPED = /^\s*<([A-Za-z][\w-]*)(?:\s[^>]*)?>[\s\S]*<\/\1>\s*$/
+
+/** What the user typed: wrapped attachment parts are skipped unless nothing else is left. */
 function textOf(content: unknown): string {
   if (typeof content === "string") return content
   if (!Array.isArray(content)) return ""
-  return content.flatMap(part => part && typeof part === "object" && (part as {type?: unknown}).type === "text" &&
-    typeof (part as {text?: unknown}).text === "string" ? [(part as {text: string}).text] : []).join("\n")
+  const texts = content.flatMap(part => part && typeof part === "object" && (part as {type?: unknown}).type === "text" &&
+    typeof (part as {text?: unknown}).text === "string" ? [(part as {text: string}).text] : [])
+  const typed = texts.filter(text => !WRAPPED.test(text))
+  return (typed.length ? typed : texts).join("\n")
 }
 
 /** Semantic candidates for the background refresh; the request path never awaits this. */
