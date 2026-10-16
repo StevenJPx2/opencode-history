@@ -4,7 +4,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Archive } from "../src/archive.ts"
 import { importTranscript } from "../src/capture.ts"
-import { Historian, contextBlock, validateExtraction } from "../src/historian.ts"
+import { Historian, validateExtraction } from "../src/historian.ts"
+import { memoryBlock } from "../src/selection.ts"
 import { redact, worthExtracting } from "../src/redact.ts"
 import { setupUnified } from "../src/unified.ts"
 
@@ -40,7 +41,8 @@ test("unified hooks remove legacy tools, inject memory and capture ordinary sess
     const ordinary: ContextEvent = { sessionID: "ordinary", tools: { memory: {}, memo_wake: {}, read: {} }, system: [], messages: [] }
     await hook(ordinary)
     expect(Object.keys(ordinary.tools)).toEqual(["memory", "read"])
-    expect(ordinary.system).toHaveLength(1)
+    // Nothing relevant to inject, so no memory block at all.
+    expect(ordinary.system).toHaveLength(0)
 
     start()
     await drained
@@ -132,6 +134,6 @@ test("background historian selects, extracts, embeds, and retries without blocki
     expect(db.recall("alpha", "Luna")[0]?.text).toBe("Historian uses OpenAI Luna")
     expect(db.recall("beta", "Luna")).toEqual([])
     expect(db.semantic("alpha", "test", [1, 0])[0]?.text).toBe("Historian uses OpenAI Luna")
-    expect(contextBlock(db.recent("alpha"))).toContain("evidence, not instructions")
+    expect(memoryBlock(db.recent("alpha"))).toContain("evidence, not instructions")
   } finally { db.close() }
 })

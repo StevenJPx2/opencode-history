@@ -2,13 +2,14 @@ import type { Plugin } from "@opencode/plugin"
 import { existsSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
-import { Archive, digest, type Remembered, type Scope } from "./archive.ts"
+import { Archive, digest, type Scope } from "./archive.ts"
 import { memoryStatus, recordAudit } from "./audit.ts"
 import { CaptureQueue, exportTranscript } from "./capture.ts"
 import { Generator } from "./generator.ts"
-import { Historian, contextBlock, fuse, modelMemory, retrieve } from "./historian.ts"
+import { Historian, modelMemory, retrieve } from "./historian.ts"
 import { migrateOptMem } from "./migrate.ts"
 import { modelEvidence } from "./passages.ts"
+import { contextQuery, memoryBlock, selectMemories, semanticCandidates, SEMANTIC_FLOOR, type Candidate } from "./selection.ts"
 import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
 import { listSessions, SessionPool, type SessionApi } from "./sessions.ts"
 
@@ -61,7 +62,9 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
     for (const row of archive.db.query<{evidence:string}, []>("SELECT DISTINCT s.evidence FROM sources s LEFT JOIN vectors v ON v.memory=s.memory WHERE v.memory IS NULL").all()) archive.enqueue(row.evidence,"embed")
   }
   const controller = new AbortController()
-  const refreshed = new Map<string,{query:string; memories:Remembered[];busy:boolean}>()
+  const refreshed = new Map<string,{query:string; candidates:Candidate[];busy:boolean}>()
+  // Calibrated for the default embedding model; another model may need its own floor.
+  const semanticFloor = typeof ctx.options.semanticFloor === "number" ? ctx.options.semanticFloor : SEMANTIC_FLOOR
 
   function maintain() {
     void capture.pass().then(() => worker.pass()).catch(() => log("background memory maintenance failed; jobs retained"))
@@ -112,21 +115,19 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
 
   await ctx.session.hook("context", async event => {
     for (const name of LEGACY_TOOLS) delete event.tools[name]
-    const user = [...event.messages].reverse().find(message => message.role === "user")
-    const content = user?.content
-    const query = typeof content === "string" ? content : Array.isArray(content) ? content.flatMap(part => part.type === "text" ? [part.text] : []).join("\n") : ""
+    const query = contextQuery(event.messages)
     const key = digest(query)
     const known = refreshed.get(event.sessionID)
-    const exact = archive.recall(project,query,18)
-    const recent = archive.recent(project,6)
-    const ready = known?.query === key ? known.memories : []
-    event.system.push({type:"text",text:contextBlock(fuse([exact,ready,recent],18))})
+    const semantic = known?.query === key ? known.candidates : []
+    const block = memoryBlock(selectMemories(archive,project,query,{semantic,semanticFloor,...embeddings ? {model:embeddings.model} : {}}))
+    // Nothing relevant: inject nothing rather than filler.
+    if (block) event.system.push({type:"text",text:block})
     // Never await the embedding service or a generator in the task request.
     if (embeddings && (!known || known.query !== key) && !known?.busy) {
-      const state = {query:key,memories:[] as Remembered[],busy:true}
+      const state = {query:key,candidates:[] as Candidate[],busy:true}
       refreshed.set(event.sessionID,state)
-      void retrieve(archive,embeddings,project,query,AbortSignal.any([controller.signal,AbortSignal.timeout(5000)]))
-        .then(memories => {state.memories=memories}).finally(() => {state.busy=false})
+      void semanticCandidates(archive,embeddings,project,query,AbortSignal.any([controller.signal,AbortSignal.timeout(5000)]))
+        .then(candidates => {state.candidates=candidates}).catch(() => {}).finally(() => {state.busy=false})
       if (refreshed.size>100) refreshed.delete(refreshed.keys().next().value!)
     }
   })

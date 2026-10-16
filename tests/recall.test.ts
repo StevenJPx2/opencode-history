@@ -33,7 +33,8 @@ test("injection carries this project's and global memories, never another projec
   const root = seeded()
   const host = await startHost({ root })
   try {
-    const block = await injected(host, "what is the release code?")
+    // Injection is relevance-gated, so ask about both the code and the preference.
+    const block = await injected(host, "what is the release code, and do I prefer concise answers?")
     expect(block).toContain("amber-otter")
     expect(block).toContain("User prefers concise answers.")
     expect(block).not.toContain("violet-kestrel")

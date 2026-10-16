@@ -217,6 +217,11 @@ export class Archive {
     const match = expression(query)
     if (!match) return this.recent(project, limit)
 
+    return this.matching(project, match, limit)
+  }
+
+  /** Active memories in scope matching a prepared FTS expression, best first. */
+  matching(project: Scope, match: string, limit = 12): Remembered[] {
     const rows = this.db.query<{id: string}, [string,string,string,number]>(`
       SELECT m.id FROM memory_search f JOIN memories m ON m.id=f.id
       WHERE memory_search MATCH ? AND (?='all' OR EXISTS(SELECT 1 FROM scopes s WHERE s.memory=m.id AND s.scope IN (?, 'global')))
@@ -224,6 +229,16 @@ export class Archive {
       ORDER BY rank LIMIT ?
     `).all(match, project, project, bounded(limit))
     return rows.map(row => this.memory(row.id)!)
+  }
+
+  /** How many active memories in scope match, or all of them without `match`. */
+  countActive(project: Scope, match?: string): number {
+    const active = `(?='all' OR EXISTS(SELECT 1 FROM scopes s WHERE s.memory=m.id AND s.scope IN (?, 'global')))
+      AND NOT EXISTS(SELECT 1 FROM memories newer WHERE newer.supersedes=m.id AND newer.status='confirmed')`
+    return match === undefined
+      ? this.db.query<{n: number}, [string,string]>(`SELECT count(*) n FROM memories m WHERE ${active}`).get(project, project)!.n
+      : this.db.query<{n: number}, [string,string,string]>(`SELECT count(*) n FROM memory_search f JOIN memories m ON m.id=f.id WHERE memory_search MATCH ? AND ${active}`)
+        .get(match, project, project)!.n
   }
 
   recent(project: Scope, limit = 12): Remembered[] {
@@ -267,6 +282,11 @@ export class Archive {
   }
 
   semantic(project: Scope, model: string, vector: number[], limit = 12): Remembered[] {
+    return this.semanticScored(project, model, vector, limit).map(row => row.memory)
+  }
+
+  /** Cosine similarity of every active in-scope memory to the query, best first. */
+  semanticScored(project: Scope, model: string, vector: number[], limit = 12): Array<{memory: Remembered; score: number}> {
     const query = normalize(vector)
     const rows = this.db.query<{memory: string; vector: Uint8Array}, [string,number,string,string]>(`
       SELECT v.memory,v.vector FROM vectors v JOIN memories m ON m.id=v.memory
@@ -276,7 +296,18 @@ export class Archive {
     return rows.map(row => {
       const values = new Float32Array(Uint8Array.from(row.vector).buffer)
       return {id: row.memory, score: query.reduce((sum, value, i) => sum + value * values[i]!, 0)}
-    }).sort((a,b) => b.score-a.score || a.id.localeCompare(b.id)).slice(0, bounded(limit)).map(row => this.memory(row.id)!)
+    }).sort((a,b) => b.score-a.score || a.id.localeCompare(b.id)).slice(0, bounded(limit)).map(row => ({memory: this.memory(row.id)!, score: row.score}))
+  }
+
+  /** Stored, normalized vectors for these memories under one model. */
+  vectorsFor(ids: readonly string[], model: string): Map<string, Float32Array> {
+    const found = new Map<string, Float32Array>()
+    const query = this.db.query<{vector: Uint8Array}, [string,string]>("SELECT vector FROM vectors WHERE memory=? AND model=?")
+    for (const id of ids) {
+      const row = query.get(id, model)
+      if (row) found.set(id, new Float32Array(Uint8Array.from(row.vector).buffer))
+    }
+    return found
   }
 
   /** Each plugin instance contributes its location and release; stale ones fall away. */

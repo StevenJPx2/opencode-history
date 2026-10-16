@@ -65,7 +65,12 @@ Set `"mode": "unified"` in the plugin options to replace the `memo_*` tools with
 - Historian calls add nothing to any session's history. Each model uses one empty child session, shared by every project and excluded from OpenCode's top-level session lists (still inspectable under its parent). If the parent is deleted, a new child is created under another ordinary session. With no parent available, extraction waits instead of creating a visible root. Empty historian roots from older releases are removed using their recorded IDs; sessions containing messages or children are preserved. This requires OpenCode's `parentID` creation support (verified on v2.0.29), not the unsupported archive field.
 - A model that fails cools down (shared by every open project), honouring a provider's retry-after, so a model in the chain that is down is skipped for the rest of its cooldown and the next one answers. A job whose model output stays unusable is marked `failed` after five attempts; outages and reloads do not use up attempts.
 - Secrets are masked locally before any archived text or stored memory reaches a model.
-- Each model request gets a bounded block of project and global memories. The `memory` tool asks the historian when that is not enough.
+- Each model request gets a bounded block of relevant project and global memories, or none when nothing is relevant. The `memory` tool asks the historian when that is not enough.
+  - Relevance: a keyword match needs several specific terms (words found in over 10% of memories do not count), or one identifier such as a hash or model name. With embeddings, a semantic match must reach `semanticFloor` (default `0.8`, calibrated for EmbeddingGemma 2). Recency can reorder matches but never admits one alone.
+  - A terse follow-up, such as "Is it working?", is searched together with the previous user message.
+  - Paraphrased duplicates are shown once, as the most specific wording. Entries with different numbers or statuses are never merged.
+  - Entries are dated and shown oldest first. An unresolved or proposed entry with a related, later confirmed one is flagged as possibly resolved, never hidden. Explicit corrections still hide what they supersede.
+  - The block names `memory_status` for current health, because remembered counts are past snapshots. It omits archive IDs; the stored memories and sources are unchanged.
 
 Existing OptMem notes, scopes, summaries and config are imported on startup. The import checks every byte, can be re-run safely, and never writes to the original store.
 
