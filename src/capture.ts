@@ -36,7 +36,11 @@ export function importTranscript(archive: Archive, project: string, raw: string,
       const at = typeof time.created === "number" && Number.isFinite(time.created) ? time.created : 0
       const id = `message:${session}:${message.id}:${digest(payload)}`
       const text = transcriptText(message)
-      archive.capture({id,project,session,message:message.id,kind:"original",at,text:"",payload},false)
+      // A session moved to another project keeps its earlier messages where
+      // they happened; only identical content may adopt the earlier project.
+      const prior = archive.evidence(id)
+      const scope = prior && prior.kind === "original" && prior.session === session && prior.payload === payload ? prior.project : project
+      archive.capture({id,project:scope,session,message:message.id,kind:"original",at,text:"",payload},false)
       // Never extract an in-flight assistant response. Durable event capture
       // retains intermediate states; a later completed export supplies passages.
       if (message.type === "assistant" && time.completed === undefined) continue
@@ -44,7 +48,7 @@ export function importTranscript(archive: Archive, project: string, raw: string,
 
       for (let start = 0; start < text.length; start += 7600) {
         const end = Math.min(text.length,start+8000)
-        const passage: Evidence = {id:`passage:${id}:${start}`,project,session,message:message.id,
+        const passage: Evidence = {id:`passage:${id}:${start}`,project:scope,session,message:message.id,
           kind:message.type,at,text:text.slice(start,end),payload:JSON.stringify({original:id,start,end})}
         if (archive.capture(passage)) added++
       }
@@ -114,8 +118,10 @@ export class CaptureQueue {
       }).immediate()
       if (!job) return
 
+      let stage: "export" | "import" = "export"
       try {
         const raw = await this.read(this.executable,job.session,job.directory,this.controller.signal,this.server)
+        stage = "import"
         this.archive.db.transaction(() => {
           const owned = this.archive.db.query("SELECT 1 FROM captures WHERE session=? AND token=? AND lease>?").get(job.session,job.token,Date.now())
           if (!owned) return
@@ -130,10 +136,12 @@ export class CaptureQueue {
         // After shutdown the archive may be closed; the expired lease retries it.
         if (this.stopped) return
 
+        // Fixed text only: the stage, never the error's own words.
+        const reason = stage === "export" ? "Full export failed; queued for retry" : "Transcript import failed; queued for retry"
         this.archive.db.query("UPDATE captures SET token=NULL,lease=0,ready=?,error=? WHERE session=? AND token=?")
-          .run(Date.now()+60_000,"Full export failed; queued for retry",job.session,job.token)
-        this.log("conversation export failed; queued for retry")
-        recordAudit(this.archive, {at: Date.now(), op:"capture", outcome:"deferred", subject:job.session, reason:"Full export failed; queued for retry", count:0})
+          .run(Date.now()+60_000,reason,job.session,job.token)
+        this.log(`conversation ${stage} failed; queued for retry`)
+        recordAudit(this.archive, {at: Date.now(), op:"capture", outcome:"deferred", subject:job.session, reason, count:0})
       }
     }
   }

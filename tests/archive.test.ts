@@ -9,6 +9,15 @@ const roots: string[] = []
 afterAll(() => roots.forEach(root => rmSync(root, {recursive: true, force: true})))
 const evidence = (id: string, project = "alpha"): Evidence => ({id,project,session:"s",message:id,kind:"user",at:1,text:"decided OpenAI Luna",payload:JSON.stringify({id})})
 
+test("the correction check every retrieval runs uses an index, not a scan of all memories", () => {
+  const db = new Archive(":memory:")
+  try {
+    const plan = db.db.query<{detail: string}, [string,string]>("EXPLAIN QUERY PLAN SELECT 1 FROM memories newer WHERE newer.supersedes=? AND newer.status=?")
+      .all("x", "confirmed").map(row => row.detail).join(" ")
+    expect(plan).toContain("USING INDEX")
+  } finally { db.close() }
+})
+
 test("capture is idempotent and refuses a changed source identity", () => {
   const db = new Archive(":memory:")
   try {

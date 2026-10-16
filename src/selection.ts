@@ -14,6 +14,8 @@ export interface Selected extends Remembered {
 export interface SelectOptions {
   /** Pre-scored semantic candidates, from `semanticCandidates`. */
   semantic?: readonly Candidate[]
+  /** The question's embedding; word-only matches far from it are dropped. */
+  queryVector?: readonly number[]
   /** Embedding model whose stored vectors back deduplication. */
   model?: string
   semanticFloor?: number
@@ -23,6 +25,14 @@ export interface SelectOptions {
 
 /** Relevant memories scored >= 0.80 with EmbeddingGemma 2; an off-topic query peaked at 0.70. */
 export const SEMANTIC_FLOOR = 0.8
+/**
+ * A word match must also be this close in meaning when the question's embedding
+ * is known. Incidental matches (an `rg` instruction finding a migration note)
+ * scored 0.63 to 0.69; relevant word matches scored 0.72 and above.
+ */
+export const KEYWORD_FLOOR = 0.7
+/** Embedding cost grows with length (~0.1 s short, ~1.1 s at 8,000 characters); the typed question comes first. */
+export const QUERY_EMBED_CHARS = 2000
 /** Paraphrases scored 0.946 to 0.978. Distinct facts can score as high, so numbers must agree too. */
 const DUPLICATE_SIMILARITY = 0.94
 /** A pending item and a later confirmation of the same topic. Only flags, never hides. */
@@ -93,11 +103,13 @@ function textOf(content: unknown): string {
   return (typed.length ? typed : texts).join("\n")
 }
 
-/** Semantic candidates for the background refresh; the request path never awaits this. */
-export async function semanticCandidates(archive: Archive, embeddings: Embeddings, scope: Scope, query: string, signal: AbortSignal): Promise<Candidate[]> {
-  if (!query.trim()) return []
-  const [vector] = await embeddings.encode([query.slice(0, 8000)], "query", signal)
-  return archive.semanticScored(scope, embeddings.model, vector!, 24)
+export interface Semantic { vector: number[]; candidates: Candidate[] }
+
+/** The question's embedding and its closest memories. Callers bound how long they wait. */
+export async function semanticCandidates(archive: Archive, embeddings: Embeddings, scope: Scope, query: string, signal: AbortSignal): Promise<Semantic> {
+  if (!query.trim()) return { vector: [], candidates: [] }
+  const [vector] = await embeddings.encode([query.slice(0, QUERY_EMBED_CHARS)], "query", signal)
+  return { vector: vector!, candidates: archive.semanticScored(scope, embeddings.model, vector!, 24) }
 }
 
 /** Keyword candidates: several specific terms must match, not one common word. */
@@ -118,7 +130,21 @@ function keywordCandidates(archive: Archive, scope: Scope, query: string): Candi
   }).sort((a, b) => b.score - a.score)
 }
 
-const cosine = (a: Float32Array, b: Float32Array) => { let sum = 0; for (let i = 0; i < a.length; i++) sum += a[i]! * b[i]!; return sum }
+const cosine = (a: ArrayLike<number>, b: ArrayLike<number>) => { let sum = 0; for (let i = 0; i < a.length; i++) sum += a[i]! * b[i]!; return sum }
+
+/** Drop word matches whose meaning is far from the question. Unindexed memories keep the word rule. */
+function nearEnough(archive: Archive, candidates: Candidate[], options: SelectOptions): Candidate[] {
+  const raw = options.queryVector
+  if (!raw?.length || !options.model) return candidates
+  const norm = Math.hypot(...raw)
+  if (!norm || !Number.isFinite(norm)) return candidates
+  const query = raw.map(value => value / norm)
+  const vectors = archive.vectorsFor(candidates.map(candidate => candidate.memory.id), options.model)
+  return candidates.filter(candidate => {
+    const vector = vectors.get(candidate.memory.id)
+    return !vector || vector.length !== query.length || cosine(query, vector) >= KEYWORD_FLOOR
+  })
+}
 function jaccard(a: string, b: string): number {
   const x = new Set(tokens(a)), y = new Set(tokens(b))
   const shared = [...x].filter(token => y.has(token)).length
@@ -129,7 +155,7 @@ const subset = (a: Set<string>, b: Set<string>) => [...a].every(value => b.has(v
 export function selectMemories(archive: Archive, scope: Scope, query: string, options: SelectOptions = {}): Selected[] {
   const now = options.now ?? Date.now()
   const floor = options.semanticFloor ?? SEMANTIC_FLOOR
-  const keyword = keywordCandidates(archive, scope, query)
+  const keyword = nearEnough(archive, keywordCandidates(archive, scope, query), options)
   const semantic = (options.semantic ?? []).filter(candidate => candidate.score >= floor)
 
   // Reciprocal-rank fusion across the two admitted lists, plus a small recency

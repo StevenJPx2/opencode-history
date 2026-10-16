@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Archive } from "../src/archive.ts"
-import { importTranscript } from "../src/capture.ts"
+import { CaptureQueue, importTranscript } from "../src/capture.ts"
 import { Historian, validateExtraction } from "../src/historian.ts"
 import { memoryBlock } from "../src/selection.ts"
 import { redact, worthExtracting } from "../src/redact.ts"
@@ -100,6 +100,42 @@ test("transcript import keeps originals and only queues completed conversational
     const kinds = db.db.query<{ kind: string; count: number }, []>("SELECT kind,count(*) count FROM evidence GROUP BY kind ORDER BY kind").all()
     expect(kinds).toEqual([{ kind: "assistant", count: 1 }, { kind: "original", count: 4 }, { kind: "transcript", count: 2 }, { kind: "user", count: 1 }])
     expect(() => importTranscript(db, "alpha", transcript(), "other")).toThrow("Invalid full transcript")
+  } finally { db.close() }
+})
+
+test("a session moved to another project re-imports: earlier messages keep their project, new ones take the new one", () => {
+  const db = new Archive(":memory:")
+  try {
+    const before = transcript()
+    expect(importTranscript(db, "alpha", before, "ses_1")).toBe(2)
+    const moved = JSON.parse(before)
+    moved.messages.push(
+      { id: "m4", type: "user", text: "Now continue in the beta project.", time: { created: 4 } },
+      { id: "m5", type: "assistant", content: [{ type: "text", text: "Decision confirmed: beta stores its archive in SQLite." }], time: { created: 5, completed: 6 } },
+    )
+    expect(importTranscript(db, "beta", JSON.stringify(moved), "ses_1")).toBe(2)
+    const projects = db.db.query<{ message: string; project: string }, []>("SELECT DISTINCT message,project FROM evidence WHERE kind='original' ORDER BY message").all()
+    expect(projects).toEqual([
+      { message: "m1", project: "alpha" }, { message: "m2", project: "alpha" }, { message: "m3", project: "alpha" },
+      { message: "m4", project: "beta" }, { message: "m5", project: "beta" },
+    ])
+    // Changed content at an existing ID is still refused.
+    const tampered = JSON.parse(before)
+    db.db.query("UPDATE evidence SET hash='different' WHERE id LIKE 'passage:%m2%'").run()
+    expect(() => importTranscript(db, "alpha", JSON.stringify(tampered), "ses_1")).toThrow("Evidence changed")
+  } finally { db.close() }
+})
+
+test("an import failure is reported as an import failure, not an export failure", async () => {
+  const db = new Archive(":memory:")
+  const logs: string[] = []
+  try {
+    const queue = new CaptureQueue(db, async () => "not json", "opencode", message => logs.push(message))
+    queue.request("ses_bad", "alpha", "/tmp")
+    await queue.pass()
+    expect(db.db.query<{ error: string }, []>("SELECT error FROM captures").get()?.error).toBe("Transcript import failed; queued for retry")
+    expect(db.audit({ limit: 1 })[0]?.reason).toBe("Transcript import failed; queued for retry")
+    expect(logs).toEqual(["conversation import failed; queued for retry"])
   } finally { db.close() }
 })
 

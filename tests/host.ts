@@ -48,6 +48,8 @@ export async function startHost(options: {
   models?: Array<{ providerID: string; id: string; variant?: string }>
   /** Answers per model; anything not scripted fails as an outage. */
   script?: Record<string, Array<string | Error>>
+  /** Extra plugin options, such as `embeddingURL`. */
+  options?: Record<string, unknown>
 }): Promise<Host> {
   const root = options.root ?? mkdtempSync(join(tmpdir(), "optmem-host-"))
   const archivePath = join(root, "archive.sqlite")
@@ -71,7 +73,7 @@ export async function startHost(options: {
   })
 
   const ctx = {
-    options: { archivePath, memoryDir: join(root, "no-legacy-store") },
+    options: { archivePath, memoryDir: join(root, "no-legacy-store"), ...options.options },
     location: { directory, project: { canonical: directory } },
     tool: { transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => callback({ add: tool => tools.set(tool.name, tool) }) },
     generate: {

@@ -4,6 +4,7 @@
 import { expect, test } from "bun:test"
 import { Archive, type Remembered } from "../src/archive.ts"
 import { contextQuery, memoryBlock, selectMemories } from "../src/selection.ts"
+import { EMBEDDING_MODEL } from "../src/services.ts"
 import { removeRoot, startHost } from "./host.ts"
 
 const MODEL = "test-embedding"
@@ -61,6 +62,21 @@ test("semantic matches must clear an absolute similarity floor", () => {
     const semantic = archive.semanticScored("alpha", MODEL, [1, 0, 0], 10)
     expect(texts(selectMemories(archive, "alpha", "How should I approach this?", { now: NOW, semantic, model: MODEL, semanticFloor: 0.8 })))
       .toEqual(["Tests should be broad and stability-focused."])
+  } finally { archive.close() }
+})
+
+test("once the question's meaning is known, a word-only match far from it is dropped", () => {
+  const archive = archiveWith([...filler(30),
+    { id: "near", text: "User wants file contents searched with rg instead of grep.", vector: [1, 0.2, 0] },
+    { id: "far", text: "A dry-run migration searched contents of the legacy store with rg.", vector: [0.3, 1, 0] },
+    { id: "unindexed", text: "Searched contents with rg in the release checklist." },
+  ])
+  try {
+    const query = "Search file contents with rg, not grep"
+    expect(texts(selectMemories(archive, "alpha", query, { now: NOW, model: MODEL })).sort()).toHaveLength(3)
+    // Memories without a stored vector are judged on words alone, as before.
+    expect(texts(selectMemories(archive, "alpha", query, { now: NOW, model: MODEL, queryVector: [1, 0, 0] })).sort())
+      .toEqual(["Searched contents with rg in the release checklist.", "User wants file contents searched with rg instead of grep."])
   } finally { archive.close() }
 })
 
@@ -162,6 +178,57 @@ test("a short follow-up with attachments borrows the previous typed question, no
     { role: "user", content: attached("Which release is deployed?") },
     { role: "user", content: attached("Is it working?") },
   ])).toBe("Which release is deployed?\nIs it working?")
+})
+
+/** A loopback embedding service: "ocean" questions point one way, everything else another. */
+function embeddingServer(delayMs = 0) {
+  const calls: string[] = []
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const body = await request.json() as { texts: string[]; model: string }
+    calls.push(...body.texts)
+    if (delayMs) await Bun.sleep(delayMs)
+    return Response.json({ model: body.model, vectors: body.texts.map(text => /ocean|sea|tide/i.test(text) ? [1, 0, 0] : [0, 1, 0]) })
+  } })
+  return { url: `http://127.0.0.1:${server.port}`, calls, stop: () => server.stop(true) }
+}
+
+async function semanticHost(delayMs: number) {
+  const service = embeddingServer(delayMs)
+  const host = await startHost({ options: { embeddingURL: service.url } })
+  const archive = new Archive(host.archivePath)
+  const project = archive.project(host.directory)
+  // Shares no words with the question below, so only meaning can find it.
+  for (const row of [...filler(30), { id: "tides", text: "The marina schedule follows lunar tidal charts.", vector: [1, 0.05, 0] }]) {
+    archive.capture({ id: `e-${row.id}`, project, session: "s", message: row.id, kind: "assistant", at: 1, text: row.text, payload: "{}" }, false)
+    archive.remember({ id: row.id, text: row.text, at: NOW, status: "confirmed", scopes: [project], sources: [`e-${row.id}`] })
+    archive.putVector(row.id, EMBEDDING_MODEL, "vector" in row ? row.vector : [0, 1, 0])
+  }
+  // Startup queues re-embedding for these memories; this test is about queries only.
+  archive.db.query("DELETE FROM jobs").run()
+  return { service, host, archive }
+}
+const systemText = async (host: Awaited<ReturnType<typeof startHost>>, sessionID: string, prompt: string) =>
+  (await host.context(sessionID, prompt)).system.map(part => part.text).join("\n")
+
+test("the first request of a turn already gets semantic matches when embeddings answer quickly", async () => {
+  const { service, host, archive } = await semanticHost(0)
+  try {
+    expect(await systemText(host, "ses_a", "When does the sea come in?")).toContain("lunar tidal charts")
+    // Only a bounded slice of a huge prompt is embedded.
+    await systemText(host, "ses_b", `ocean ${"x".repeat(20_000)}`)
+    expect(Math.max(...service.calls.map(text => text.length))).toBeLessThanOrEqual(2000)
+  } finally { host.dispose(); await Bun.sleep(20); archive.close(); service.stop(); removeRoot(host.root) }
+})
+
+test("a slow embedding service delays the request only briefly, and later steps still benefit", async () => {
+  const { service, host, archive } = await semanticHost(1500)
+  try {
+    const started = performance.now()
+    expect(await systemText(host, "ses_slow", "When does the sea come in?")).not.toContain("lunar tidal charts")
+    expect(performance.now() - started).toBeLessThan(1000)
+    await Bun.sleep(1700)
+    expect(await systemText(host, "ses_slow", "When does the sea come in?")).toContain("lunar tidal charts")
+  } finally { host.dispose(); await Bun.sleep(20); archive.close(); service.stop(); removeRoot(host.root) }
 })
 
 test("through the plugin hook: irrelevant turns get no memory block; relevant ones do", async () => {

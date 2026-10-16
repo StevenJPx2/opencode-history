@@ -9,13 +9,15 @@ import { Generator } from "./generator.ts"
 import { Historian, modelMemory, retrieve } from "./historian.ts"
 import { migrateOptMem } from "./migrate.ts"
 import { modelEvidence } from "./passages.ts"
-import { contextQuery, memoryBlock, selectMemories, semanticCandidates, SEMANTIC_FLOOR, type Candidate } from "./selection.ts"
+import { contextQuery, memoryBlock, selectMemories, semanticCandidates, SEMANTIC_FLOOR, type Semantic } from "./selection.ts"
 import { embeddingService, EMBEDDING_MODEL } from "./services.ts"
 import { listSessions, SessionPool, type SessionApi } from "./sessions.ts"
 
 type Context = Plugin.Context
 const option = (ctx: Context, key: string, fallback: string) => typeof ctx.options[key] === "string" ? ctx.options[key] as string : fallback
 const expand = (path: string) => path.startsWith("~/") ? join(homedir(),path.slice(2)) : path
+/** Longest a model request waits for the question's embedding. */
+const FIRST_WAIT_MS = 400
 const LEGACY_TOOLS = ["memo_wake","memo_note","memo_nap","memo_recall","memo_zoom","memo_scope","memo_forget"]
 
 /** A pinned release lives in .../releases/<hash>; a working copy runs from the repo. */
@@ -62,7 +64,8 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
     for (const row of archive.db.query<{evidence:string}, []>("SELECT DISTINCT s.evidence FROM sources s LEFT JOIN vectors v ON v.memory=s.memory WHERE v.memory IS NULL").all()) archive.enqueue(row.evidence,"embed")
   }
   const controller = new AbortController()
-  const refreshed = new Map<string,{query:string; candidates:Candidate[];busy:boolean}>()
+  type Refresh = {query:string; semantic:Semantic; busy:boolean; ready:Promise<void>}
+  const refreshed = new Map<string,Refresh>()
   // Calibrated for the default embedding model; another model may need its own floor.
   const semanticFloor = typeof ctx.options.semanticFloor === "number" ? ctx.options.semanticFloor : SEMANTIC_FLOOR
 
@@ -117,19 +120,24 @@ export async function setupUnified(ctx: Context, models: Array<{providerID:strin
     for (const name of LEGACY_TOOLS) delete event.tools[name]
     const query = contextQuery(event.messages)
     const key = digest(query)
-    const known = refreshed.get(event.sessionID)
-    const semantic = known?.query === key ? known.candidates : []
-    const block = memoryBlock(selectMemories(archive,project,query,{semantic,semanticFloor,...embeddings ? {model:embeddings.model} : {}}))
+    let known = refreshed.get(event.sessionID)
+    if (embeddings && (!known || known.query !== key) && !known?.busy) {
+      const state: Refresh = {query:key,semantic:{vector:[],candidates:[]},busy:true,ready:Promise.resolve()}
+      state.ready = semanticCandidates(archive,embeddings,project,query,AbortSignal.any([controller.signal,AbortSignal.timeout(5000)]))
+        .then(semantic => {state.semantic=semantic}).catch(() => {}).finally(() => {state.busy=false})
+      refreshed.set(event.sessionID,state)
+      if (refreshed.size>100) refreshed.delete(refreshed.keys().next().value!)
+      known = state
+    }
+    // The local embedding service usually answers in ~0.1 s. Wait briefly so the
+    // first request benefits; never longer, and never for a generator.
+    if (known?.query === key && known.busy) await Promise.race([known.ready,new Promise(resolve => setTimeout(resolve,FIRST_WAIT_MS).unref?.())])
+    const semantic = known?.query === key ? known.semantic : undefined
+    const block = memoryBlock(selectMemories(archive,project,query,{semanticFloor,
+      ...semantic ? {semantic:semantic.candidates,queryVector:semantic.vector} : {},
+      ...embeddings ? {model:embeddings.model} : {}}))
     // Nothing relevant: inject nothing rather than filler.
     if (block) event.system.push({type:"text",text:block})
-    // Never await the embedding service or a generator in the task request.
-    if (embeddings && (!known || known.query !== key) && !known?.busy) {
-      const state = {query:key,candidates:[] as Candidate[],busy:true}
-      refreshed.set(event.sessionID,state)
-      void semanticCandidates(archive,embeddings,project,query,AbortSignal.any([controller.signal,AbortSignal.timeout(5000)]))
-        .then(candidates => {state.candidates=candidates}).catch(() => {}).finally(() => {state.busy=false})
-      if (refreshed.size>100) refreshed.delete(refreshed.keys().next().value!)
-    }
   })
 
   // Durable event capture preserves original data even between exports. Export

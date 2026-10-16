@@ -87,6 +87,7 @@ export class Archive {
         token TEXT, error TEXT, UNIQUE(evidence,phase));
       CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(state,ready,lease);
       CREATE INDEX IF NOT EXISTS evidence_project ON evidence(project,at);
+      CREATE INDEX IF NOT EXISTS memories_supersedes ON memories(supersedes);
       CREATE VIRTUAL TABLE IF NOT EXISTS evidence_search USING fts5(id UNINDEXED,text);
       CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(id UNINDEXED,text);
       CREATE TABLE IF NOT EXISTS audit(
