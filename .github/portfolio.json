@@ -1,0 +1,18 @@
+{
+  "name": "OpenCode History",
+  "body": [
+    "A **`history_search` tool** that lets agents search earlier OpenCode sessions by keyword (**SQLite FTS5**, BM25): what the user asked, what the agent answered, and session summaries. Each result can be **opened in full**.",
+    "A short **recent-work block** for each new session, quoting the project's latest sessions. It is built once and then frozen, so the model's **prompt cache** stays valid.",
+    "Reads OpenCode's own database **read-only**, with a rebuildable index beside it: **no model calls**, no copied transcripts and no background services."
+  ],
+  "areas": [
+    "developer-tools",
+    "ai-agents"
+  ],
+  "technologies": {
+    "add": [
+      "opencode",
+      "sql"
+    ]
+  }
+}
