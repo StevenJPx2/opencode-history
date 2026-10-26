@@ -60,6 +60,25 @@ Options, through the object form of the plugin entry:
 
 - `database`: OpenCode's database, default `$XDG_DATA_HOME/opencode/opencode.db`
 - `index`: the sidecar index, default `$XDG_DATA_HOME/opencode-history/index.sqlite`
+- `audit`: a JSONL path, default `audit.jsonl` beside the index; `false` disables it
+
+## Tool availability and audit
+
+If Chauffeur manages your tools, keep `history_search` in `base` in its
+`tool-exposure.json`. A local `base` list replaces the shipped list, so it must
+include the tool too. This prevents prompt-based tool hiding; it does not
+override OpenCode's own agent permissions.
+
+Each executed `history_search` call writes one small audit row: timestamp,
+calling session ID, search/open mode, requested scope and whether a session
+filter was used, duration, result count and indexing backlog, or an error
+category (`invalid_input`, `message_not_found`, `execution_failed`). Queries,
+target IDs, passages and raw error messages are never logged. Calls rejected
+by OpenCode before plugin execution are not visible to this audit.
+
+The log rotates at 1 MiB to `audit.jsonl.1`, keeping only that previous file.
+Files are owner-readable/writable; audit failures never fail a tool call.
+The default path is `~/.local/share/opencode-history/audit.jsonl`.
 
 ## Develop
 

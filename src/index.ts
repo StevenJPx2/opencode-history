@@ -12,7 +12,8 @@
 import { Plugin } from "@opencode/plugin"
 import type { Database } from "bun:sqlite"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { AuditLog, type AuditEvent } from "./audit.ts"
 import { HistoryIndex, openSource, readMessage, recentSessions, sessionInfo, type FullMessage, type Hit, type RecentSession } from "./history.ts"
 
 const RECENT_SESSIONS = 5
@@ -105,14 +106,34 @@ const SEARCH_INPUT = {
 
 interface SearchInput { query?: string; scope?: "project" | "all"; session?: string; limit?: number; open?: string }
 
-/** One tool, two modes: search with `query`, or read one whole message with `open`. */
-function execute(index: HistoryIndex, source: Database, input: SearchInput, sessionID: string): string {
-  if ((input.query === undefined) === (input.open === undefined)) throw new Error("Pass either `query` to search or `open` with a message ID, not both.")
+class UsageError extends Error {
+  constructor(readonly code: "invalid_input" | "message_not_found", message: string) { super(message) }
+}
 
+/** Check inside execution too, so malformed calls reaching the plugin are audited. */
+function searchInput(raw: unknown): SearchInput {
+  const invalid = (message: string): never => { throw new UsageError("invalid_input", message) }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return invalid("Pass an object with either `query` or `open`.")
+
+  const input = raw as Record<string, unknown>
+  if (Object.keys(input).some(key => !Object.hasOwn(SEARCH_INPUT.properties, key))) return invalid("Unknown history_search option.")
+  if ((input.query === undefined) === (input.open === undefined)) return invalid("Pass either `query` to search or `open` with a message ID, not both.")
+  if (input.query !== undefined && (typeof input.query !== "string" || !input.query.trim() || input.query.length > 2000)) return invalid("`query` must be nonblank text of at most 2000 characters.")
+  if (input.open !== undefined && (typeof input.open !== "string" || !input.open.trim())) return invalid("`open` must be a nonblank message ID.")
+  if (input.scope !== undefined && input.scope !== "project" && input.scope !== "all") return invalid("`scope` must be project or all.")
+  if (input.session !== undefined && (typeof input.session !== "string" || !input.session.trim())) return invalid("`session` must be a nonblank session ID.")
+  if (input.limit !== undefined && (typeof input.limit !== "number" || !Number.isInteger(input.limit) || input.limit < 1 || input.limit > 20)) return invalid("`limit` must be an integer from 1 to 20.")
+  return input as SearchInput
+}
+
+interface SearchResult { content: string; results: number; pending?: number }
+
+/** One tool, two modes: search with `query`, or read one whole message with `open`. */
+function execute(index: HistoryIndex, source: Database, input: SearchInput, sessionID: string): SearchResult {
   if (input.open !== undefined) {
     const message = readMessage(source, input.open)
-    if (!message) throw new Error(`No searchable message ${input.open}. Use a msg_… ID exactly as a search result printed it.`)
-    return formatMessage(message)
+    if (!message) throw new UsageError("message_not_found", `No searchable message ${input.open}. Use a msg_… ID exactly as a search result printed it.`)
+    return { content: formatMessage(message), results: 1 }
   }
 
   const info = sessionInfo(source, sessionID)
@@ -125,7 +146,7 @@ function execute(index: HistoryIndex, source: Database, input: SearchInput, sess
     limit: input.limit ?? 8,
   })
   const scope = input.session ? "that session's" : project ? "this project's" : "all"
-  return formatResults(input.query!, scope, hits, pending)
+  return { content: formatResults(input.query!, scope, hits, pending), results: hits.length, pending }
 }
 
 export default Plugin.define({
@@ -133,7 +154,9 @@ export default Plugin.define({
   async setup(ctx) {
     const log = (message: string) => console.log(`[history] ${message}`)
     const source = openSource(option(ctx.options, "database", join(dataHome(), "opencode/opencode.db")))
-    const index = new HistoryIndex(option(ctx.options, "index", join(dataHome(), "opencode-history/index.sqlite")))
+    const indexPath = option(ctx.options, "index", join(dataHome(), "opencode-history/index.sqlite"))
+    const index = new HistoryIndex(indexPath)
+    const audit = ctx.options.audit === false ? undefined : new AuditLog(option(ctx.options, "audit", join(dirname(indexPath), "audit.jsonl")), log)
     const stopBackfill = backfill(index, source, log)
 
     await ctx.tool.transform(editor => {
@@ -145,7 +168,29 @@ export default Plugin.define({
           "and retry with other words if nothing matches. Results are short passages; `open` a result's message ID to read it whole.",
         input: SEARCH_INPUT,
         options: { codemode: false },
-        execute: async (raw, context) => ({ content: execute(index, source, raw as SearchInput, context.sessionID) }),
+        execute: async (raw, context) => {
+          const started = performance.now()
+          const event: AuditEvent = { session: context.sessionID, mode: "invalid", status: "error", duration_ms: 0 }
+          try {
+            const input = searchInput(raw)
+            event.mode = input.open !== undefined ? "open" : "search"
+            if (event.mode === "search") {
+              event.scope = input.scope ?? "project"
+              event.session_filter = input.session !== undefined
+            }
+            const result = execute(index, source, input, context.sessionID)
+            event.status = "ok"
+            event.results = result.results
+            if (result.pending !== undefined) event.pending = result.pending
+            return { content: result.content }
+          } catch (error) {
+            event.error = error instanceof UsageError ? error.code : "execution_failed"
+            throw error
+          } finally {
+            event.duration_ms = Math.round(performance.now() - started)
+            audit?.record(event)
+          }
+        },
       })
     })
 

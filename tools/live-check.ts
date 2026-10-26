@@ -4,8 +4,8 @@
 //   bun tools/live-check.ts [provider/model]
 import { spawnSync } from "node:child_process"
 import { Database } from "bun:sqlite"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { homedir, tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 import { stageRelease } from "./stage-release.ts"
 
@@ -18,6 +18,14 @@ const env = Object.fromEntries(Object.entries(process.env).filter(([key, value])
 Object.assign(env, { XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_STATE_HOME: join(root, "state"), XDG_CACHE_HOME: join(root, "cache") })
 mkdirSync(join(root, "config/opencode"), { recursive: true, mode: 0o700 })
 writeFileSync(join(root, "config/opencode/opencode.jsonc"), JSON.stringify({ plugins: [release], model: `${providerID}/${id}` }))
+// Provider credentials for this run only; removed again in `finally`.
+const realAuth = join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local/share"), "opencode/auth.json")
+const isolatedAuth = join(root, "data/opencode/auth.json")
+if (existsSync(realAuth)) {
+  mkdirSync(join(root, "data/opencode"), { recursive: true, mode: 0o700 })
+  copyFileSync(realAuth, isolatedAuth)
+  chmodSync(isolatedAuth, 0o600)
+}
 const work = join(root, "work")
 mkdirSync(work)
 
@@ -61,6 +69,11 @@ try {
   check(calls > 0, `the model called history_search (${calls}x)`)
   check(second.transcript.includes(first.id) && second.transcript.includes("PELICAN"), "history_search returned the earlier session and its passage")
 
+  const audit = readFileSync(join(root, "data/opencode-history/audit.jsonl"), "utf8")
+  const events = audit.trim().split("\n").map(line => JSON.parse(line))
+  check(events.some(event => event.session === second.id && event.mode === "search" && event.status === "ok" && event.results > 0), "the real tool call wrote a successful audit row")
+  check(!audit.includes("PELICAN") && !audit.includes("codeword"), "the audit contains neither query nor passage text")
+
   const index = new Database(join(root, "data/opencode-history/index.sqlite"), { readonly: true })
   const block = index.query<{ text: string }, [string]>("SELECT text FROM blocks WHERE session=?").get(second.id)?.text ?? ""
   index.close()
@@ -70,6 +83,7 @@ try {
   if (started) {
     try { cli(["service", "stop"]) } catch { console.log("could not stop the isolated service") }
   }
+  rmSync(isolatedAuth, { force: true })
   if (passed) rmSync(root, { recursive: true, force: true })
   else console.log(`kept for inspection: ${root}`)
   if (!passed) process.exitCode = 1

@@ -1,4 +1,5 @@
 import { afterAll, expect, test } from "bun:test"
+import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
 import plugin from "../src/index.ts"
 import { assistant, fixture, removeFixtures, text, type Fixture } from "./fixture.ts"
@@ -9,11 +10,11 @@ type Tool = { name: string; options?: { codemode?: boolean }; execute: (input: u
 type ContextEvent = { sessionID: string; system: Array<{ type: string; text: string }> }
 
 /** The host surface the plugin uses: tool registration and the context hook. */
-async function load(f: Fixture) {
+async function load(f: Fixture, options: Record<string, unknown> = {}) {
   const tools = new Map<string, Tool>()
   let hook!: (event: ContextEvent) => void | Promise<void>
   const ctx = {
-    options: { database: f.path, index: join(f.root, "index.sqlite") },
+    options: { database: f.path, index: join(f.root, "index.sqlite"), ...options },
     tool: { transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => callback({ add: tool => tools.set(tool.name, tool) }) },
     session: { hook: async (name: string, callback: typeof hook) => { if (name === "context") hook = callback } },
   }
@@ -125,5 +126,92 @@ test("a project with no earlier sessions gets no block at all", async () => {
   const host = await load(f)
   try {
     expect(await host.context("ses_first")).toBe("")
+  } finally { host.dispose() }
+})
+
+test("audit records search, empty results, open, and usage failures without their contents", async () => {
+  const f = fixture()
+  project(f)
+  const id = f.message("ses_old", "user", { text: "private passage to open" })
+  const host = await load(f)
+  try {
+    await host.search("ses_now", { query: "idempotency", scope: "all", session: "ses_other" })
+    await host.search("ses_now", { query: "privatequerynomatch" })
+    await host.search("ses_now", { open: id })
+    await expect(host.search("ses_now", { open: "msg_private_missing" })).rejects.toThrow("No searchable message")
+    await expect(host.search("ses_now", {})).rejects.toThrow("either `query`")
+
+    const log = readFileSync(join(f.root, "audit.jsonl"), "utf8")
+    const events = log.trim().split("\n").map(line => JSON.parse(line))
+    expect(events).toHaveLength(5)
+    expect(events[0]).toMatchObject({ tool: "history_search", session: "ses_now", mode: "search", status: "ok", scope: "all", session_filter: true, results: 1, pending: 0 })
+    expect(events[1]).toMatchObject({ mode: "search", status: "ok", results: 0 })
+    expect(events[2]).toMatchObject({ mode: "open", status: "ok", results: 1 })
+    expect(events[3]).toMatchObject({ mode: "open", status: "error", error: "message_not_found" })
+    expect(events[4]).toMatchObject({ mode: "invalid", status: "error", error: "invalid_input" })
+    for (const event of events) {
+      expect(Number.isFinite(Date.parse(event.at))).toBe(true)
+      expect(event.duration_ms).toBeGreaterThanOrEqual(0)
+    }
+    for (const privateText of ["idempotency", "privatequerynomatch", "private passage", "msg_private_missing", "ses_other", id]) {
+      expect(log).not.toContain(privateText)
+    }
+  } finally { host.dispose() }
+})
+
+test("malformed tool input is rejected and audited", async () => {
+  const f = fixture()
+  project(f)
+  const host = await load(f)
+  const inputs = [null, [], "private", { query: 1 }, { query: " " }, { query: "x".repeat(2001) },
+    { open: "" }, { query: "x", open: "msg_x" }, { query: "x", scope: "bad" }, { query: "x", session: 1 },
+    { query: "x", limit: 0 }, { query: "x", limit: 21 }, { query: "x", limit: 1.5 }, { query: "x", extra: true }]
+  try {
+    for (const input of inputs) await expect(host.search("ses_now", input)).rejects.toThrow()
+    const events = readFileSync(join(f.root, "audit.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line))
+    expect(events).toHaveLength(inputs.length)
+    expect(events.every(event => event.status === "error" && event.error === "invalid_input")).toBe(true)
+  } finally { host.dispose() }
+})
+
+test("audit records execution errors without changing the failure", async () => {
+  const f = fixture()
+  project(f)
+  const host = await load(f)
+  try {
+    f.db.exec("DROP TABLE session_message")
+    await expect(host.search("ses_now", { query: "private query" })).rejects.toThrow("session_message")
+    const log = readFileSync(join(f.root, "audit.jsonl"), "utf8")
+    expect(JSON.parse(log)).toMatchObject({ mode: "search", status: "error", error: "execution_failed" })
+    expect(log).not.toContain("private query")
+    expect(log).not.toContain("session_message")
+  } finally { host.dispose() }
+})
+
+test("audit can be disabled or placed elsewhere", async () => {
+  const f = fixture()
+  project(f)
+  const disabled = await load(f, { audit: false })
+  try {
+    await disabled.search("ses_now", { query: "idempotency" })
+    expect(existsSync(join(f.root, "audit.jsonl"))).toBe(false)
+  } finally { disabled.dispose() }
+
+  const path = join(f.root, "custom", "usage.jsonl")
+  const custom = await load(f, { audit: path })
+  try {
+    await custom.search("ses_now", { query: "idempotency" })
+    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ status: "ok" })
+  } finally { custom.dispose() }
+})
+
+test("audit write failure does not break the tool or mask a usage error", async () => {
+  const f = fixture()
+  project(f)
+  // A database file cannot be used as a directory.
+  const host = await load(f, { audit: join(f.path, "audit.jsonl") })
+  try {
+    expect((await host.search("ses_now", { query: "idempotency" })).content).toContain("ses_old")
+    await expect(host.search("ses_now", {})).rejects.toThrow("either `query`")
   } finally { host.dispose() }
 })
