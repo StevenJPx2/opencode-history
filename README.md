@@ -71,3 +71,7 @@ bun tools/live-check.ts       # end-to-end in an isolated OpenCode with a free m
 ```
 
 [`PLAN.md`](PLAN.md) records work that is deliberately on hold.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
