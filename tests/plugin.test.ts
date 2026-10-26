@@ -1,44 +1,10 @@
 import { afterAll, expect, test } from "bun:test"
 import { existsSync, readFileSync } from "node:fs"
 import { join } from "node:path"
-import plugin from "../src/index.ts"
-import { assistant, fixture, removeFixtures, text, type Fixture } from "./fixture.ts"
+import { assistant, fixture, removeFixtures, text } from "./fixture.ts"
+import { load, project } from "./host.ts"
 
 afterAll(removeFixtures)
-
-type Tool = { name: string; options?: { codemode?: boolean }; execute: (input: unknown, context: { sessionID: string; signal: AbortSignal }) => Promise<{ content: string }> }
-type ContextEvent = { sessionID: string; system: Array<{ type: string; text: string }> }
-
-/** The host surface the plugin uses: tool registration and the context hook. */
-async function load(f: Fixture, options: Record<string, unknown> = {}) {
-  const tools = new Map<string, Tool>()
-  let hook!: (event: ContextEvent) => void | Promise<void>
-  const ctx = {
-    options: { database: f.path, index: join(f.root, "index.sqlite"), ...options },
-    tool: { transform: async (callback: (editor: { add: (tool: Tool) => void }) => void) => callback({ add: tool => tools.set(tool.name, tool) }) },
-    session: { hook: async (name: string, callback: typeof hook) => { if (name === "context") hook = callback } },
-  }
-  // SAFETY: the fake implements exactly the context members the plugin uses.
-  const dispose = await plugin.setup(ctx as unknown as Parameters<typeof plugin.setup>[0])
-  const search = (sessionID: string, input: unknown) => tools.get("history_search")!.execute(input, { sessionID, signal: new AbortController().signal })
-  const context = async (sessionID: string) => {
-    const event: ContextEvent = { sessionID, system: [] }
-    await hook(event)
-    return event.system.map(part => part.text).join("\n")
-  }
-  return { tools, search, context, dispose: dispose as () => void }
-}
-
-function project(f: Fixture) {
-  f.session("ses_old", "p1", "Webhook retries")
-  f.message("ses_old", "user", { text: "why does the stripe webhook retry" })
-  f.message("ses_old", "assistant", assistant({ type: "tool", name: "bash", state: { output: "idempotency in tool output" } }, text("The idempotency key was missing")))
-  f.session("ses_other", "p2", "Other project")
-  f.message("ses_other", "assistant", assistant(text("idempotency elsewhere")))
-  f.session("ses_now", "p1", "Current work")
-  f.message("ses_now", "user", { text: "idempotency again?" })
-  f.session("ses_child", "p1", "Explore", "ses_now")
-}
 
 test("history_search registers as a direct tool and finds earlier project work, not the asking session", async () => {
   const f = fixture()

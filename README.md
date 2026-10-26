@@ -1,7 +1,8 @@
 # opencode-history
 
 Searchable session history for OpenCode agents, read from OpenCode's own
-database. No extra memory store, no model calls, no background services.
+database. No extra memory store and no background services; the only model
+call is the optional recall judge.
 
 - `history_search` finds earlier sessions by keyword (SQLite FTS5, BM25) and
   quotes the matching passages: what you typed, what the agent replied, and
@@ -16,6 +17,10 @@ database. No extra memory store, no model calls, no background services.
   is quoted, nothing generated. It is built at the session's first request and
   then frozen, so every request of that session carries identical text and the
   provider's prompt cache stays valid. Subagents get no block.
+- Per-turn recall: before your message is admitted, the plugin finds up to 8
+  candidate passages from earlier sessions in the project and asks a hosted
+  judge whether each would help. Up to 3 it accepts arrive as a
+  `<history_recall>` synthetic message just before yours. See Recall below.
 
 ## How it works
 
@@ -61,6 +66,25 @@ Options, through the object form of the plugin entry:
 - `database`: OpenCode's database, default `$XDG_DATA_HOME/opencode/opencode.db`
 - `index`: the sidecar index, default `$XDG_DATA_HOME/opencode-history/index.sqlite`
 - `audit`: a JSONL path, default `audit.jsonl` beside the index; `false` disables it
+- `recall`: `false` turns per-turn recall off
+
+## Recall
+
+Recall runs only when `TYPESAFE_API_KEY` is in OpenCode's environment; it calls
+TypeSafe's Jev at `/v1/systemone`. `TYPESAFE_BASE_URL` and
+`TYPESAFE_DEFAULT_MODEL` override the endpoint and model.
+
+- **What is sent:** your message, the last 600 characters of the agent's
+  previous reply, and up to 8 passages of 800 characters from earlier sessions
+  in the same project. Nothing is redacted.
+- **What is attached:** passages the judge rates at p ≥ 0.7, at most 3, as one
+  synthetic message saved in the session's history. The agent can `open` each
+  passage's `msg_…` ID with `history_search`.
+- **Cost:** your message waits for the search and the judge, about 0.3 s.
+  The judge gets 2.5 s; a timeout, error or malformed answer attaches nothing,
+  and your message is always admitted.
+- **Skipped:** subagent sessions, blank messages, and messages starting with
+  `<`, `[` or `/` (injected reminders, monitor events, commands).
 
 ## Tool availability and audit
 
@@ -76,6 +100,11 @@ category (`invalid_input`, `message_not_found`, `execution_failed`). Queries,
 target IDs, passages and raw error messages are never logged. Calls rejected
 by OpenCode before plugin execution are not visible to this audit.
 
+Each recall the judge is asked about, or that finds no candidates, writes a
+`history_recall` row: session ID, duration, candidate count and attached count,
+or an error category (`judge_failed`, `judge_timeout`, `execution_failed`).
+Messages and passages are never logged.
+
 The log rotates at 1 MiB to `audit.jsonl.1`, keeping only that previous file.
 Files are owner-readable/writable; audit failures never fail a tool call.
 The default path is `~/.local/share/opencode-history/audit.jsonl`.
@@ -89,7 +118,7 @@ bun run history-sync          # build or refresh the index by hand, with progres
 bun tools/live-check.ts       # end-to-end in an isolated OpenCode with a free model
 ```
 
-[`PLAN.md`](PLAN.md) records work that is deliberately on hold.
+[`PLAN.md`](PLAN.md) records the recall design and its evidence, and work on hold.
 
 ## License
 

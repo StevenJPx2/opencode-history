@@ -6,15 +6,19 @@ import { dirname } from "node:path"
 export const AUDIT_BYTES = 1024 * 1024
 
 export interface AuditEvent {
+  /** Defaults to `history_search`. */
+  tool?: "history_search" | "history_recall"
   session: string
-  mode: "search" | "open" | "invalid"
+  mode: "search" | "open" | "invalid" | "recall"
   status: "ok" | "error"
   duration_ms: number
   scope?: "project" | "all"
   session_filter?: boolean
+  /** Passages a recall offered the judge. */
+  candidates?: number
   results?: number
   pending?: number
-  error?: "invalid_input" | "message_not_found" | "execution_failed"
+  error?: "invalid_input" | "message_not_found" | "execution_failed" | "judge_failed" | "judge_timeout"
 }
 
 export class AuditLog {

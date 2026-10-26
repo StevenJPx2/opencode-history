@@ -45,6 +45,22 @@ export interface SearchOptions {
   readonly limit?: number
 }
 
+/** A recall candidate: a search hit with a window of its chunk's text. */
+export interface Passage extends Hit {
+  readonly text: string
+}
+
+export interface RecallOptions {
+  readonly project: string
+  /** The asking session; it and its subagents are left out. */
+  readonly exclude: string
+  readonly limit: number
+  /** Characters of each chunk kept, around its rarest matching word. */
+  readonly chars: number
+  /** Only chunks written before this time; replays use it. */
+  readonly before?: number
+}
+
 export interface SessionInfo { readonly project: string; readonly parent: string | null }
 
 export interface RecentSession {
@@ -162,6 +178,15 @@ export function readMessage(source: Database, messageID: string): FullMessage | 
     SELECT m.id, m.session_id AS session, coalesce(s.title,'') AS title, m.type AS kind, m.time_created AS at, ${MESSAGE_TEXT} AS text
     FROM session_message m JOIN session_v2 s ON s.id=m.session_id WHERE m.id=? AND m.type IN ${INDEXED_TYPES}`).get(messageID)
   return row?.text?.trim() ? { ...row, text: row.text } : undefined
+}
+
+/** The end of the session's latest assistant reply that has text, or an empty string. */
+export function previousReply(source: Database, sessionID: string, chars: number): string {
+  const rows = source.query<{ text: string | null }, [string]>(`
+    SELECT ${MESSAGE_TEXT} AS text FROM session_message m
+    WHERE m.session_id=? AND m.type='assistant' ORDER BY m.seq DESC LIMIT 5`).all(sessionID)
+  const text = rows.map(row => row.text?.replace(/\s+/g, " ").trim() ?? "").find(Boolean) ?? ""
+  return text.length > chars ? `…${text.slice(-chars)}` : text
 }
 
 /** The session's project and parent, straight from OpenCode, or undefined for an unknown ID. */
@@ -326,6 +351,64 @@ export class HistoryIndex {
     const best = new Map<string, Hit>()
     for (const row of rows) if (!best.has(row.session)) best.set(row.session, row)
     return [...best.values()].slice(0, limit)
+  }
+
+  /**
+   * Recall candidates for a user message: the best chunk of each matching
+   * session in the project, best first, skipping text a forked session repeats.
+   */
+  recallCandidates(message: string, options: RecallOptions): Passage[] {
+    const expression = matchExpression(message)
+    if (!expression) return []
+
+    const terms = [...expression.matchAll(/"([^"]+)"/g)].map(match => match[1]!)
+    const rows = this.db.query<Hit & { text: string }, [string, string, string, string, number]>(`
+      SELECT c.session, s.title, c.message, c.kind, c.at, snippet(chunks_fts, 0, '', '', '…', 24) AS snippet, c.text
+      FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid JOIN sessions s ON s.id=c.session
+      WHERE chunks_fts MATCH ? AND s.project=? AND c.session<>? AND coalesce(s.parent,'')<>? AND c.at<?
+      ORDER BY bm25(chunks_fts) LIMIT 400`)
+      .all(expression, options.project, options.exclude, options.exclude, options.before ?? Number.MAX_SAFE_INTEGER)
+
+    const sessions = new Set<string>()
+    const snippets = new Set<string>()
+    const out: Passage[] = []
+    for (const row of rows) {
+      const snippet = row.snippet.replace(/\s+/g, " ").trim()
+      if (sessions.has(row.session) || snippets.has(snippet)) continue
+      sessions.add(row.session)
+      snippets.add(snippet)
+      out.push({ ...row, snippet, text: this.window(row.text, terms, options.chars) })
+      if (out.length === options.limit) break
+    }
+    return out
+  }
+
+  private readonly shares = new Map<string, number>()
+
+  /** The share of chunks containing `term`, remembered per process. */
+  private share(term: string): number {
+    let value = this.shares.get(term)
+    if (value === undefined) {
+      const total = this.db.query<{ n: number }, []>("SELECT count(*) AS n FROM chunks").get()?.n || 1
+      const count = this.db.query<{ n: number }, [string]>("SELECT count(*) AS n FROM chunks_fts WHERE chunks_fts MATCH ?").get(`"${term}"`)?.n ?? 0
+      value = count / total
+      if (this.shares.size >= 10_000) this.shares.clear()
+      this.shares.set(term, value)
+    }
+    return value
+  }
+
+  /** Up to `chars` of the text, around the first place its rarest matching term appears. */
+  private window(text: string, terms: readonly string[], chars: number): string {
+    const clean = text.replace(/\s+/g, " ").trim()
+    if (clean.length <= chars) return clean
+    const lower = clean.toLowerCase()
+    // The index stems words, so a term's first letters also find its other forms.
+    const hits = terms.map(term => ({ term, at: lower.indexOf(term.slice(0, 5)) })).filter(hit => hit.at >= 0)
+      .sort((a, b) => this.share(a.term) - this.share(b.term))
+    const center = hits[0]?.at ?? 0
+    const start = Math.max(0, Math.min(Math.floor(center - chars / 3), clean.length - chars))
+    return `${start > 0 ? "…" : ""}${clean.slice(start, start + chars)}${start + chars < clean.length ? "…" : ""}`
   }
 
   /** The block first built for `session`, so every request of that session carries identical text. */

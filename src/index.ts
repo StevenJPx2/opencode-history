@@ -7,14 +7,19 @@
 // - Each top-level session gets a short "recent work" block: the project's
 //   latest sessions, quoted, built once and then frozen so every request of the
 //   session carries identical text and the provider's prompt cache stays valid.
+// - Per-turn recall: before a user's message is admitted, candidate passages
+//   from earlier sessions go to a hosted judge, and those it accepts arrive as
+//   a synthetic message just before the user's (see recall.ts).
 //
-// Nothing here calls a model or writes to OpenCode's database.
+// Nothing here writes to OpenCode's database; the recall's synthetic message
+// goes through OpenCode's session API.
 import { Plugin } from "@opencode/plugin"
 import type { Database } from "bun:sqlite"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 import { AuditLog, type AuditEvent } from "./audit.ts"
-import { HistoryIndex, openSource, readMessage, recentSessions, sessionInfo, type FullMessage, type Hit, type RecentSession } from "./history.ts"
+import { HistoryIndex, openSource, previousReply, readMessage, recentSessions, sessionInfo, type FullMessage, type Hit, type RecentSession } from "./history.ts"
+import { CANDIDATES, chosen, judge, judgeConfig, JudgeError, PASSAGE_CHARS, PREVIOUS_CHARS, recallText, type JudgeConfig } from "./recall.ts"
 
 const RECENT_SESSIONS = 5
 const GIST_CHARS = 200
@@ -24,6 +29,10 @@ const OPEN_CHARS = 12_000
 const BACKFILL_STEP_MS = 30
 /** Time a search spends bringing the index up to date first; the backfill catches up on the rest. */
 const SEARCH_SYNC_MS = 100
+/** Longest wait for the recall judge, which holds the user's message until it answers. */
+const JUDGE_TIMEOUT_MS = 2500
+/** Messages that are injected reminders, monitor events or commands, not something to recall for. */
+const NOT_RECALLED = /^\s*[<[/]/
 
 const dataHome = () => process.env.XDG_DATA_HOME || join(homedir(), ".local/share")
 const expand = (path: string) => path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path
@@ -149,6 +158,40 @@ function execute(index: HistoryIndex, source: Database, input: SearchInput, sess
   return { content: formatResults(input.query!, scope, hits, pending), results: hits.length, pending }
 }
 
+interface PromptEvent { readonly sessionID: string; readonly messageID: string; readonly prompt: { text?: string } }
+type SendSynthetic = (input: { sessionID: string; text: string; resume: boolean; metadata: { "opencode-history": { recall: string } } }) => Promise<unknown>
+
+/**
+ * Recalls earlier history for one message about to be admitted. Never throws:
+ * OpenCode refuses a message whose prompt hook fails.
+ */
+async function recall(index: HistoryIndex, source: Database, config: JudgeConfig, send: SendSynthetic,
+  audit: AuditLog | undefined, log: (message: string) => void, event: PromptEvent): Promise<void> {
+  const started = performance.now()
+  const record = (fields: Pick<AuditEvent, "status"> & Partial<AuditEvent>) =>
+    audit?.record({ tool: "history_recall", session: event.sessionID, mode: "recall", duration_ms: Math.round(performance.now() - started), ...fields })
+  try {
+    const text = event.prompt.text ?? ""
+    if (!text.trim() || NOT_RECALLED.test(text)) return
+    const info = sessionInfo(source, event.sessionID)
+    if (!info || info.parent !== null) return
+
+    index.sync(source, { budgetMs: SEARCH_SYNC_MS })
+    const passages = index.recallCandidates(text, { project: info.project, exclude: event.sessionID, limit: CANDIDATES, chars: PASSAGE_CHARS })
+    if (!passages.length) return record({ status: "ok", candidates: 0, results: 0 })
+
+    const probabilities = await judge(config, text, previousReply(source, event.sessionID, PREVIOUS_CHARS), passages)
+    const attached = chosen(passages, probabilities)
+    if (attached.length) {
+      await send({ sessionID: event.sessionID, text: recallText(attached), resume: false, metadata: { "opencode-history": { recall: event.messageID } } })
+    }
+    record({ status: "ok", candidates: passages.length, results: attached.length })
+  } catch (error) {
+    record({ status: "error", error: error instanceof JudgeError ? error.code : "execution_failed" })
+    if (!(error instanceof JudgeError)) log(`recall skipped (${error instanceof Error ? error.message : "unknown error"})`)
+  }
+}
+
 export default Plugin.define({
   id: "opencode-history",
   async setup(ctx) {
@@ -193,6 +236,12 @@ export default Plugin.define({
         },
       })
     })
+
+    const judgeAt = ctx.options.recall === false ? undefined : judgeConfig(process.env, JUDGE_TIMEOUT_MS)
+    if (judgeAt) {
+      const send: SendSynthetic = input => ctx.session.synthetic(input)
+      await ctx.session.hook("prompt", event => recall(index, source, judgeAt, send, audit, log, event))
+    }
 
     await ctx.session.hook("context", event => {
       // Context is optional; a failure here must never block the user's request.
