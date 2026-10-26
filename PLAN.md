@@ -1,7 +1,12 @@
-# On hold: per-turn pointers
+# On hold
 
-**Status:** tabled. Revisit only if agents miss relevant history that the
-recent-work block and `history_search` should have surfaced.
+Two ideas for surfacing history the agent didn't ask for. Both wait for the
+same evidence: agents missing relevant history that the recent-work block and
+`history_search` should have surfaced.
+
+# Per-turn pointers
+
+**Status:** tabled.
 
 ## Idea
 
@@ -43,3 +48,37 @@ reworded. Embeddings were dropped as not worth an always-on model server.
 
 The retired OptMem notes were dropped after a check on 61 of them: search found
 the right session for most, and `open` reads any result's message whole.
+
+# A project summary tree, after UniiChat
+
+**Status:** tabled; the fallback if per-turn pointers prove too imprecise.
+
+[UniiChat](https://github.com/VictorTaelin/uniichat) (OptMem's author) gives
+every call a fading overview of the whole chat. A cheaper model summarises each
+message in one line and merges neighbouring lines in pairs into a binary tree.
+Each call sees up to 128 KB: recent messages line by line, older stretches as
+fewer, broader lines. `zoom` opens any line into its two halves, down to the
+original message.
+
+| | UniiChat | This plugin |
+|---|---|---|
+| Automatic context | Overview of all history, up to 128 KB a call | 5 quoted lines, about 1.5 KB |
+| Finding detail | `zoom` down the tree; no keyword search | `history_search`, then `open` |
+| Model calls | One per message and per merged pair | None |
+| Recall of exact detail | Lossy: 512-byte lines drop SHAs, counts, error text | Exact quotes |
+
+What it does better: the agent notices relevant history it would never have
+searched for, and answers broad questions ("what did we do this month?") that
+have no keywords to search.
+
+## A light version, if needed
+
+Build the tree per project from OpenCode's compaction summaries rather than
+every message. Those are already model-written, so no extra model calls are
+needed. Use it as the recent-work block's frozen content, with `open` as the zoom.
+
+| Concern | Detail |
+|---|---|
+| Coverage | Only sessions long enough to compact have summaries: 187 of about 1,060 top-level sessions. The rest would need their first ask, as the block uses now. |
+| Merging | Merging summaries upward needs a model, which brings back the background job this plugin removed. |
+| Prompt cache | The tree must change only at its newest end, as UniiChat's does, or every session's frozen block grows stale fast. |
