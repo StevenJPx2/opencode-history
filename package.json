@@ -10,6 +10,7 @@
   },
   "scripts": {
     "stage-release": "bun tools/stage-release.ts",
+    "release": "bun tools/stage-release.ts --activate",
     "history-sync": "bun tools/history-sync.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests",

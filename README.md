@@ -42,26 +42,30 @@ can be deleted at any time; the plugin rebuilds it.
 
 ## Install
 
-Stage a fixed release, then point OpenCode at it:
+Stage a fixed release and activate it:
 
 ```sh
-bun run stage-release
+bun run release                                  # stage this checkout and activate it
+bun run stage-release                            # stage only
+bun tools/stage-release.ts --activate <release>  # activate an existing release, such as a rollback
 ```
 
-```jsonc
-// ~/.config/opencode/opencode.jsonc
-{
-  "plugins": ["/absolute/path/printed/by/stage-release"]
-}
-```
+`stage-release` copies runtime files and installs locked dependencies into a
+separate, content-addressed release under
+`~/.local/share/opencode-history/releases`, and never changes an existing one.
+
+Activation writes one file, `~/.config/opencode/plugins/opencode-history/index.ts`,
+which re-exports the release. OpenCode discovers that directory without a
+config entry and reloads the plugin in place when the file changes, so no
+restart and no config edit is needed. It prints the previous release for a
+rollback. Leave `opencode-history` out of the config's `plugins` list, or the
+plugin loads twice.
 
 Do not load a working checkout in your daily OpenCode configuration: editing it
-can hot-reload the plugin during active tasks. `stage-release` copies runtime
-files and installs locked dependencies into a separate, content-addressed
-release under `~/.local/share/opencode-history/releases`, and never changes an
-existing one.
+can hot-reload the plugin during active tasks.
 
-Options, through the object form of the plugin entry:
+Options, through the object form of a `plugins` entry pointing at a release
+directory, in place of activation:
 
 - `database`: OpenCode's database, default `$XDG_DATA_HOME/opencode/opencode.db`
 - `index`: the sidecar index, default `$XDG_DATA_HOME/opencode-history/index.sqlite`
