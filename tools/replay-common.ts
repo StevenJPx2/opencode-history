@@ -2,6 +2,7 @@
 // sample, and the candidates each message would search, limited to the history
 // that existed before it.
 import { Database } from "bun:sqlite"
+import { readFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import { matchExpression } from "../src/history.ts"
@@ -107,13 +108,33 @@ function shuffled<T>(items: T[], seed = 42): T[] {
   return out
 }
 
-/** Top-level user messages in a fixed random order, without injected reminders, monitor events or commands. */
-export const messages = shuffled(db.query<UserMessage, []>(`
+const replayable = db.query<UserMessage, []>(`
   SELECT c.message, c.session, s.project, c.at, c.seq, c.text FROM chunks c JOIN sessions s ON s.id=c.session
   WHERE c.kind='user' AND c.part=0 AND s.parent IS NULL`).all()
-  .filter(message => !/^\s*[<[/]/.test(message.text)))
+  .filter(message => !/^\s*[<[/]/.test(message.text))
 
-export const flat = (text: string) => text.replace(/\s+/g, " ").trim()
+/**
+ * The messages an earlier sheet replayed, in its order, matched by session and
+ * quoted text. The index grows, so a fresh shuffle would pick other messages.
+ */
+function fromSheet(path: string): UserMessage[] {
+  const entries = [...readFileSync(path, "utf8").matchAll(/^## \d+\..*\n\S+ · (ses_\S+)\n(?:Previous reply: .*\n)?> (.*)$/gm)]
+  return entries.map(([, session, quoted]) => {
+    const prefix = quoted!.replace(/…$/, "")
+    const found = replayable.find(message => message.session === session && flat(message.text).startsWith(prefix))
+    if (!found) throw new Error(`sheet message not found in ${session}: ${prefix.slice(0, 60)}`)
+    return found
+  })
+}
+
+/**
+ * Top-level user messages in a fixed random order, without injected reminders,
+ * monitor events or commands; or, with `REPLAY_SAMPLE` set to an earlier sheet,
+ * exactly that sheet's messages.
+ */
+export const messages = process.env.REPLAY_SAMPLE ? fromSheet(process.env.REPLAY_SAMPLE) : shuffled(replayable)
+
+export function flat(text: string): string { return text.replace(/\s+/g, " ").trim() }
 export const clip = (text: string, limit: number) => { const line = flat(text); return line.length > limit ? `${line.slice(0, limit - 1)}…` : line }
 export const day = (at: number) => new Date(at).toISOString().slice(0, 10)
 export const percent = (value: number) => `${(value * 100).toFixed(value < 0.01 ? 2 : 1)}%`
