@@ -1,7 +1,7 @@
 {
-  "name": "opencode-optmem",
+  "name": "opencode-history",
   "version": "0.1.0",
-  "description": "OptMem permanent memory as native OpenCode tools.",
+  "description": "Searchable session history for OpenCode agents, read from OpenCode's own database.",
   "license": "MIT",
   "private": true,
   "type": "module",
@@ -10,8 +10,7 @@
   },
   "scripts": {
     "stage-release": "bun tools/stage-release.ts",
-    "status": "bun tools/status.ts",
-    "audit": "bun tools/status.ts audit",
+    "history-sync": "bun tools/history-sync.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test tests",
     "check": "bun run typecheck && bun run test"

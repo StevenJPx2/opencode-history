@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process"
 type File = { path: string; bytes: Buffer }
 
 function inputs(source: string): File[] {
-  const paths = ["index.ts", "package.json", "bun.lock", "tools/embedding-server.py", "tools/embedding-server.py.lock"]
+  const paths = ["index.ts", "package.json", "bun.lock"]
   function walk(directory: string): void {
     for (const entry of readdirSync(join(source, directory), { withFileTypes: true })) {
       if (entry.isSymbolicLink()) throw new Error("Release source must not contain symlinks")
@@ -72,8 +72,8 @@ export function stageRelease(source: string, releases: string, installDependenci
 
 if (import.meta.main) {
   const source = resolve(import.meta.dir, "..")
-  const releases = join(homedir(), ".local/share/optmem/releases")
+  const releases = join(homedir(), ".local/share/opencode-history/releases")
   const release = stageRelease(source, releases)
   console.log(`Staged: ${release}`)
-  console.log("Not activated. Update the plugin package path and embedding LaunchAgent only when you intend to deploy.")
+  console.log("Not activated. Update the plugin package path only when you intend to deploy.")
 }

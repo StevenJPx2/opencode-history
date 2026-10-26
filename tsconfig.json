@@ -12,5 +12,5 @@
     "allowImportingTsExtensions": true,
     "types": ["bun"]
   },
-  "include": ["index.ts", "src", "tests"]
+  "include": ["index.ts", "src", "tests", "tools"]
 }

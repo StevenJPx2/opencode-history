@@ -5,12 +5,11 @@ import { join } from "node:path"
 import { stageRelease } from "../tools/stage-release.ts"
 
 test("source edits produce a new release without changing the installed one", () => {
-  const root = mkdtempSync(join(tmpdir(), "optmem-release-test-"))
+  const root = mkdtempSync(join(tmpdir(), "history-release-test-"))
   const source = join(root, "source")
   const releases = join(root, "releases")
   mkdirSync(join(source, "src"), { recursive: true })
-  mkdirSync(join(source, "tools"))
-  for (const file of ["index.ts", "package.json", "bun.lock", "tools/embedding-server.py", "tools/embedding-server.py.lock"]) {
+  for (const file of ["index.ts", "package.json", "bun.lock"]) {
     writeFileSync(join(source, file), "fixture")
   }
   writeFileSync(join(source, "src/index.ts"), "original")
